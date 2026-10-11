@@ -4,6 +4,7 @@ Each version's section is its GitHub release's notes.
 
 ## Unreleased
 
+- **Drag with the middle mouse button to pan.** Pressing the middle button and dragging moves the board with the pointer, from empty board or over any tile, as in Figma and Miro. A middle click that doesn't move still goes to what's under it, so a terminal's paste and a browser's open-in-new-tab keep working. Before, a mouse without a trackpad could only pan with the wheel, one notch at a time.
 - **A Homebrew install opens without Gatekeeper's prompt.** After `brew install` or `brew upgrade`, the first launch waited on macOS's "downloaded from the Internet" confirmation. That prompt can open on a Space you aren't looking at, so a launch from an agent's shell (`open -g`) hung with nothing shown, and every `easl` command in your terminals waited behind it. The cask now clears the quarantine flag once easl is installed; the zip it installs is the notarized one the release published, pinned by its SHA-256. If clearing the flag fails, the install still succeeds and the first launch asks as before. This applies from the next `brew install` or `brew upgrade` on.
 
 ## 0.2.6
