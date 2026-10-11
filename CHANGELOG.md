@@ -5,6 +5,7 @@ Each version's section is its GitHub release's notes.
 ## Unreleased
 
 - **A Homebrew install opens without Gatekeeper's prompt.** After `brew install` or `brew upgrade`, the first launch waited on macOS's "downloaded from the Internet" confirmation. That prompt can open on a Space you aren't looking at, so a launch from an agent's shell (`open -g`) hung with nothing shown, and every `easl` command in your terminals waited behind it. The cask now clears the quarantine flag once easl is installed; the zip it installs is the notarized one the release published, pinned by its SHA-256. If clearing the flag fails, the install still succeeds and the first launch asks as before. This applies from the next `brew install` or `brew upgrade` on.
+- **Terminal text stays sharp on 1x displays.** On a non-Retina monitor, terminal text looked soft after a pan, a trackpad scroll or a ⌘0 jump, and sometimes from launch. Tiles and the board's scroll origin could land between pixels (a tile at x = 198.625, the board scrolled to -258.59), so macOS resampled each terminal's image and blurred its glyphs. Tile frames are now placed on whole points and the scroll origin on whole device pixels at the current zoom. Slow trackpad pans in sub-pixel steps still add up, because the exact origin is kept beside the shown one. Retina screens hid most of this, and their behavior is unchanged.
 
 ## 0.2.6
 

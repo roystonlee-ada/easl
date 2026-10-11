@@ -151,6 +151,8 @@ final class CanvasView: NSScrollView {
     private var marquee: MarqueeGesture?
     /// A press on a drawn object is tracked here (the event never reaches a view).
     private var shapePress = false
+    private var liveScrolling = false
+    private var snapScheduled = false
     private var mouseMonitor: Any?
     /// Terminals seen since their agent last started working (mirrors Board's seen set).
     private var seenLocally: Set<ObjectID> = []
@@ -231,6 +233,7 @@ final class CanvasView: NSScrollView {
         self.remote = remote
         viewportRecorder = remote == nil ? SavedViewport.Recorder(store: SavedViewport.Store(url: AppPaths.viewport(of: board.id))) : nil
         super.init(frame: .zero)
+        contentView = PixelClipView()
         documentView = document
         document.canvas = self
         document.addSubview(overlay)
@@ -254,6 +257,11 @@ final class CanvasView: NSScrollView {
         center.addObserver(self, selector: #selector(boundsChanged), name: NSView.frameDidChangeNotification, object: contentView)
         center.addObserver(self, selector: #selector(magnifyStarted), name: NSScrollView.willStartLiveMagnifyNotification, object: self)
         center.addObserver(self, selector: #selector(magnifyEnded), name: NSScrollView.didEndLiveMagnifyNotification, object: self)
+
+        // A trackpad pan is tracked by the scroll view itself, past `PixelClipView`'s constraint,
+        // so the origin is put back on a whole pixel once a gesture and its momentum end.
+        center.addObserver(self, selector: #selector(liveScrollStarted), name: NSScrollView.willStartLiveScrollNotification, object: self)
+        center.addObserver(self, selector: #selector(liveScrollEnded), name: NSScrollView.didEndLiveScrollNotification, object: self)
         center.addObserver(self, selector: #selector(boundsChanged), name: NSApplication.didBecomeActiveNotification, object: nil)
         center.addObserver(self, selector: #selector(boundsChanged), name: NSApplication.didResignActiveNotification, object: nil)
         // Placement aims at what the user can see: the viewport clear of the toolbar and tray.
@@ -310,6 +318,8 @@ final class CanvasView: NSScrollView {
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(boundsChanged), name: NSWindow.didBecomeKeyNotification, object: window)
         center.addObserver(self, selector: #selector(boundsChanged), name: NSWindow.didResignKeyNotification, object: window)
+        center.addObserver(self, selector: #selector(snapToPixels), name: NSWindow.didChangeScreenNotification, object: window)
+        center.addObserver(self, selector: #selector(snapToPixels), name: NSWindow.didChangeBackingPropertiesNotification, object: window)
         window.initialFirstResponder = document
     }
 
@@ -2310,6 +2320,7 @@ final class CanvasView: NSScrollView {
         scheduleViewportSave()
         scheduleActivitySettle()
         scheduleLiveness()
+        scheduleSnap()
     }
 
     // MARK: Viewport state (view.get, board.history)
@@ -2344,7 +2355,38 @@ final class CanvasView: NSScrollView {
 
     @objc private func magnifyEnded() {
         magnifying = false
+        snapToPixels()
         scheduleLiveness()
+    }
+
+    @objc private func liveScrollStarted() {
+        liveScrolling = true
+    }
+
+    @objc private func liveScrollEnded() {
+        liveScrolling = false
+        snapToPixels()
+    }
+
+    /// Snaps once the run loop turn that moved the view is over, unless a gesture is still
+    /// moving it: zoom changes and animated jumps set the origin past `PixelClipView` too.
+    private func scheduleSnap() {
+        guard !snapScheduled, !liveScrolling, !magnifying else { return }
+        snapScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.snapScheduled = false
+            if !self.liveScrolling, !self.magnifying { self.snapToPixels() }
+        }
+    }
+
+    /// The scroll origin back on a whole device pixel (`PixelSnap`), unless it already is.
+    @objc func snapToPixels() {
+        let origin = contentView.bounds.origin
+        let snapped = PixelSnap.snapped(origin, pixels: (window?.backingScaleFactor ?? 1) * magnification)
+        guard snapped != origin else { return }
+        contentView.scroll(to: snapped)
+        reflectScrolledClipView(contentView)
     }
 
     /// Coalesces every trigger in one run-loop turn into a single pass.
@@ -2461,5 +2503,18 @@ private final class FirstAnswer<Value: Sendable> {
     func give(_ value: Value?) {
         continuation?.resume(returning: value)
         continuation = nil
+    }
+}
+
+/// The board's clip view, its scroll origin kept on whole device pixels at the current zoom
+/// (`PixelSnap`), so a pan never leaves every tile between pixels.
+final class PixelClipView: NSClipView {
+    private var snap = PixelSnap()
+
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        let pixels = (window?.backingScaleFactor ?? 1) * (enclosingScrollView?.magnification ?? 1)
+        rect.origin = snap.origin(proposed: rect.origin, current: bounds.origin, pixels: pixels)
+        return rect
     }
 }

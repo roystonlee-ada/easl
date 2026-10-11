@@ -67,7 +67,7 @@ final class TileFrameView: NSView {
         zoom = CGFloat(object.zoom)
         zoomable = ObjectZoom.applies(to: object.type)
         roleDescription = object.type == .html ? "HTML" : object.type.rawValue
-        super.init(frame: frame)
+        super.init(frame: Self.pointAligned(frame))
         closeButton.tile = self
         card.tile = self
         wantsLayer = true
@@ -200,11 +200,18 @@ final class TileFrameView: NSView {
         layoutParts()
     }
 
+    /// `rect` with its origin on whole points. On a 1x screen a terminal surface placed between
+    /// pixels is resampled, which blurs its text; the board's model keeps the exact frame.
+    static func pointAligned(_ rect: NSRect) -> NSRect {
+        NSRect(x: rect.minX.rounded(), y: rect.minY.rounded(), width: rect.width, height: rect.height)
+    }
+
     /// Moves the tile and zooms its content in one step, so the content never lays out at a size
     /// in between.
     func place(_ rect: NSRect, zoom: CGFloat) {
         let rezoomed = zoom != self.zoom
         self.zoom = zoom
+        let rect = Self.pointAligned(rect)
         if frame != rect { frame = rect }
         if rezoomed {
             applyZoom()
