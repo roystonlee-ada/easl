@@ -1006,6 +1006,14 @@ final class TerminalTile: NSView, TileContent {
             }
             return
         }
+        if !newTile, !isRemote, hit.lines == nil, hit.file.hasPrefix("/"),
+           ["html", "htm"].contains((hit.file as NSString).pathExtension.lowercased()) {
+            // A page named without a line is shown rendered; ⌥⌘- or ⇧⌘-click, or a line, opens its source.
+            let opened = board.openLink(URL(fileURLWithPath: hit.file), near: objectID, caller: objectID)
+            NSLog("easl: terminal %@ opened %@ as %@ browser tile %@", objectID, hit.file, opened.existing ? "existing" : "new", opened.object.id)
+            onOpenedLink?(opened.object.id)
+            return
+        }
         let opened = board.openCode(path: hit.file, lines: hit.lines, beside: objectID, newTile: newTile)
         NSLog("easl: terminal %@ opened %@%@ as %@ (%@)", objectID, hit.file, hit.lines.map { ":\($0.start)-\($0.end)" } ?? "", opened.id,
               opened.created ? (newTile ? "new tile" : "new preview") : opened.existing ? "existing" : "re-aimed preview")

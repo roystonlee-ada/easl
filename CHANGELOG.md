@@ -5,6 +5,7 @@ Each version's section is its GitHub release's notes.
 ## Unreleased
 
 - **A Homebrew install opens without Gatekeeper's prompt.** After `brew install` or `brew upgrade`, the first launch waited on macOS's "downloaded from the Internet" confirmation. That prompt can open on a Space you aren't looking at, so a launch from an agent's shell (`open -g`) hung with nothing shown, and every `easl` command in your terminals waited behind it. The cask now clears the quarantine flag once easl is installed; the zip it installs is the notarized one the release published, pinned by its SHA-256. If clearing the flag fails, the install still succeeds and the first launch asks as before. This applies from the next `brew install` or `brew upgrade` on.
+- **⌘-click an HTML file in a terminal to see the page.** A `report.html` in terminal output opened its source in a code tile. It now opens rendered in a browser tile beside the terminal, and clicking it again goes to that tile instead of opening another. ⌥⌘- or ⇧⌘-click, or a path with a line (`report.html:42`), still opens the source. A remote terminal's HTML files open as code, as before, since the page is on the host.
 
 ## 0.2.6
 
