@@ -16,9 +16,17 @@ public enum WebLink {
     }
 
     /// The address as browser tiles are compared (`Board.openLink`): scheme and host lowercased,
-    /// a default port dropped, an empty path `/`. The query and the fragment stay as written (a
-    /// single-page app's `#/route` is another page). Nil for a URL that isn't http(s).
+    /// a default port dropped, an empty path `/`; a `file:` URL's path standardized (`./`, `..`)
+    /// and `file://localhost/` as `file:///`. The query and the fragment stay as written (a
+    /// single-page app's `#/route` is another page). Nil for a URL that is neither http(s) nor `file:`.
     public static func address(_ url: URL) -> String? {
+        if url.isFileURL {
+            guard var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+            parts.scheme = "file"
+            parts.host = ""
+            parts.path = url.standardizedFileURL.path
+            return parts.string
+        }
         guard isWeb(url), var parts = URLComponents(url: url, resolvingAgainstBaseURL: false), let scheme = parts.scheme?.lowercased() else { return nil }
         parts.scheme = scheme
         parts.host = parts.host?.lowercased()
@@ -112,17 +120,15 @@ extension Board {
     /// tile's `props.url`; a tile in another browser profile, `props.profile` against the
     /// `profile` in `props`, is another page) is returned as it is (`existing`) and nothing is
     /// created; otherwise a browser tile with that `url` and `props` is placed beside `source`
-    /// (`place`) and credited to `caller`. http(s) addresses are matched as above and `file:` URLs by
-    /// their standardized path; the caller hands any other scheme to the system.
+    /// (`place`) and credited to `caller`. Only http(s) and `file:` addresses are matched: the
+    /// caller hands anything else to the system.
     @discardableResult
     public func openLink(_ url: URL, near source: ObjectID?, caller: ObjectID?, props: [String: JSONValue] = [:]) -> (object: CanvasObject, existing: Bool) {
         let address = WebLink.address(url)
-        let file = url.isFileURL ? url.standardizedFileURL.path : nil
         let here = source.flatMap { objects[$0]?.frame }
-        let shown = address == nil && file == nil ? [] : objects.values.filter { object in
-            guard object.type == .browser, object.props["profile"]?.string == props["profile"]?.string,
-                  let shownURL = object.props["url"]?.string.flatMap(URL.init(string:)) else { return false }
-            return file.map { shownURL.isFileURL && shownURL.standardizedFileURL.path == $0 } ?? (WebLink.address(shownURL) == address)
+        let shown = address == nil ? [] : objects.values.filter { object in
+            object.type == .browser && object.props["profile"]?.string == props["profile"]?.string
+                && object.props["url"]?.string.flatMap(URL.init(string:)).flatMap(WebLink.address) == address
         }
         // Several tiles can show one address (the user made a second on purpose): the nearest.
         if let reused = shown.min(by: { (here.map($0.frame.centerDistance) ?? 0, $0.id) < (here.map($1.frame.centerDistance) ?? 0, $1.id) }) {

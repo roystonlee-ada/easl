@@ -35,6 +35,17 @@ struct LinkTests {
         #expect(opened.existing && opened.object.id == shown.id, "a file is matched by its standardized path")
         #expect(!board.openLink(URL(fileURLWithPath: "/tmp/site/other.html"), near: nil, caller: nil).existing, "another file is another page")
         #expect(board.objects.values.filter { $0.type == .browser }.count == 2)
+        #expect(board.openLink(URL(string: "file://localhost/tmp/site/report%20one.html")!, near: nil, caller: nil).object.id == shown.id)
+    }
+
+    @Test func aFilesAnchorOrQueryIsAnotherPage() {
+        let shown = browser("file:///tmp/site/report.html")
+        for other in ["file:///tmp/site/report.html#appendix", "file:///tmp/site/report.html?tab=2"] {
+            let opened = link(other)
+            #expect(!opened.existing && opened.object.id != shown.id, "\(other)")
+        }
+        #expect(link("file:///tmp/site/./report.html#appendix").existing, "the anchored page's own tile")
+        #expect(link("file:///tmp/site/report.html").object.id == shown.id)
     }
 
     @Test func aDifferentPathQueryOrFragmentIsAnotherPage() {

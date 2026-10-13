@@ -25,8 +25,12 @@ final class TerminalTile: NSView, TileContent {
     /// A ⌘-clicked reference opened this code tile (`created`) or re-aimed or found it there;
     /// `source` is the reference's rect in window coordinates.
     var onOpenedCode: ((CodeOpened, _ source: NSRect) -> Void)?
-    /// A web link the terminal's text activated (⌘-click on a URL) opened or found this browser
-    /// tile; the canvas shows it.
+    /// A ⌘-clicked reference to a page (`Board.referencePage`) opened this browser tile, or found
+    /// it already showing the page (`existing`); `source` as for `onOpenedCode`.
+    var onOpenedPage: ((ObjectID, _ existing: Bool, _ source: NSRect) -> Void)?
+    /// A web link the terminal's text activated (a ⌘-click on an http(s) URL Ghostty found)
+    /// opened or found this browser tile; the canvas shows it. A ⌘-clicked page path is a
+    /// reference (`onOpenedPage`), not a link.
     var onOpenedLink: ((ObjectID) -> Void)?
     /// Something asked of this terminal can't happen on this Mac (a remote terminal's file
     /// reference: the file is on the host); the canvas says `text` for a moment (`CanvasView.showNotice`).
@@ -1006,19 +1010,17 @@ final class TerminalTile: NSView, TileContent {
             }
             return
         }
-        if !newTile, !isRemote, hit.lines == nil, hit.file.hasPrefix("/"),
-           ["html", "htm"].contains((hit.file as NSString).pathExtension.lowercased()) {
-            // A page named without a line is shown rendered; ⌥⌘- or ⇧⌘-click, or a line, opens its source.
-            let opened = board.openLink(URL(fileURLWithPath: hit.file), near: objectID, caller: objectID)
-            NSLog("easl: terminal %@ opened %@ as %@ browser tile %@", objectID, hit.file, opened.existing ? "existing" : "new", opened.object.id)
-            onOpenedLink?(opened.object.id)
-            return
+        let runs = grid.map { rects(hit.runs, grid: $0).reduce(NSRect.null) { $0.union($1) } } ?? .null
+        let source = runs.isNull ? .null : underline.convert(runs, to: nil)
+        switch board.openReference(path: hit.file, lines: hit.lines, beside: objectID, newTile: newTile, hosted: host != nil) {
+        case .code(let opened):
+            NSLog("easl: terminal %@ opened %@%@ as %@ (%@)", objectID, hit.file, hit.lines.map { ":\($0.start)-\($0.end)" } ?? "", opened.id,
+                  opened.created ? (newTile ? "new tile" : "new preview") : opened.existing ? "existing" : "re-aimed preview")
+            onOpenedCode?(opened, source)
+        case let .page(id, url, existing):
+            NSLog("easl: terminal %@ link %@ → %@ %@", objectID, url.absoluteString, existing ? "existing browser tile" : "new browser tile", id)
+            onOpenedPage?(id, existing, source)
         }
-        let opened = board.openCode(path: hit.file, lines: hit.lines, beside: objectID, newTile: newTile)
-        NSLog("easl: terminal %@ opened %@%@ as %@ (%@)", objectID, hit.file, hit.lines.map { ":\($0.start)-\($0.end)" } ?? "", opened.id,
-              opened.created ? (newTile ? "new tile" : "new preview") : opened.existing ? "existing" : "re-aimed preview")
-        let source = grid.map { rects(hit.runs, grid: $0).reduce(NSRect.null) { $0.union($1) } } ?? .null
-        onOpenedCode?(opened, source.isNull ? .null : underline.convert(source, to: nil))
     }
 
     /// A URL or path Ghostty found under a ⌘-click (`TerminalSurfaceOpenURLDelegate`; with a
