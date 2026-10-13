@@ -67,7 +67,7 @@ final class TileFrameView: NSView {
         zoom = CGFloat(object.zoom)
         zoomable = ObjectZoom.applies(to: object.type)
         roleDescription = object.type == .html ? "HTML" : object.type.rawValue
-        super.init(frame: Self.pointAligned(frame))
+        super.init(frame: frame)
         closeButton.tile = self
         card.tile = self
         wantsLayer = true
@@ -200,10 +200,10 @@ final class TileFrameView: NSView {
         layoutParts()
     }
 
-    /// `rect` with its origin on whole points. On a 1x screen a terminal surface placed between
-    /// pixels is resampled, which blurs its text; the board's model keeps the exact frame.
-    static func pointAligned(_ rect: NSRect) -> NSRect {
-        NSRect(x: rect.minX.rounded(), y: rect.minY.rounded(), width: rect.width, height: rect.height)
+    /// A drag moves the tile by its origin alone.
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        content.alignToPixels()
     }
 
     /// Moves the tile and zooms its content in one step, so the content never lays out at a size
@@ -211,12 +211,12 @@ final class TileFrameView: NSView {
     func place(_ rect: NSRect, zoom: CGFloat) {
         let rezoomed = zoom != self.zoom
         self.zoom = zoom
-        let rect = Self.pointAligned(rect)
         if frame != rect { frame = rect }
         if rezoomed {
             applyZoom()
             updateZoomControl()
         }
+        content.alignToPixels()
     }
 
     /// The content at `zoom` in the body: laid out at the body divided by the zoom.
@@ -225,6 +225,7 @@ final class TileFrameView: NSView {
         let natural = NSSize(width: body.width / zoom, height: body.height / zoom)
         if abs(zoomView.bounds.width - natural.width) > 0.001 || abs(zoomView.bounds.height - natural.height) > 0.001 { zoomView.setBoundsSize(natural) }
         if content.frame.size != zoomView.bounds.size || content.frame.origin != .zero { content.frame = NSRect(origin: .zero, size: zoomView.bounds.size) }
+        content.alignToPixels()
     }
 
     private func layoutParts() {

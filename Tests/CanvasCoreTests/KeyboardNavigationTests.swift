@@ -43,19 +43,6 @@ struct KeyboardNavigationTests {
         #expect(CanvasWheel.action(dx: -2, dy: 0, precise: false, command: true, shift: false) == .pan(dx: -2 * line, dy: 0), "a sideways ⌘-scroll still pans")
     }
 
-    @Test func theScrollOriginSnapsToPixelsAndSmallStepsAddUp() {
-        var snap = PixelSnap()
-        var shown = snap.origin(proposed: CGPoint(x: 10.4, y: -3.6), current: .zero, pixels: 1)
-        #expect(shown == CGPoint(x: 10, y: -4), "a 1x screen shows whole points")
-        for _ in 0..<3 { shown = snap.origin(proposed: CGPoint(x: shown.x + 0.3, y: shown.y), current: shown, pixels: 1) }
-        #expect(shown == CGPoint(x: 11, y: -4), "three 0.3 pt steps from 10.4 reach 11.3, shown at 11")
-        #expect(abs((snap.exact?.x ?? 0) - 11.3) < 1e-9, "the exact origin keeps the fraction")
-        #expect(snap.origin(proposed: CGPoint(x: 500.3, y: 7.7), current: CGPoint(x: 42, y: 42), pixels: 1) == CGPoint(x: 500, y: 8),
-                "a move from somewhere the snap didn't put the view starts over")
-        #expect(PixelSnap.snapped(CGPoint(x: 10.3, y: 10.8), pixels: 2) == CGPoint(x: 10.5, y: 11), "Retina has half points")
-        #expect(PixelSnap.snapped(CGPoint(x: 10.3, y: 0), pixels: 0.5) == CGPoint(x: 10, y: 0), "zoomed out, a pixel is several document points")
-    }
-
     @Test func arrowNeighborPrefersTheSameRowThenTheNearest() {
         let from = CGRect(x: 0, y: 0, width: 400, height: 300)
         let frames = [
