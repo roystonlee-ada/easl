@@ -3,7 +3,7 @@ import CoreGraphics
 /// Panning the board by dragging with the middle mouse button, over empty board or any tile (the
 /// Figma and Miro convention). A press becomes a pan only once the pointer moves `threshold`
 /// screen points, so a middle click that stays put still reaches what is under it: a terminal's
-/// paste, a link opened in a new tab.
+/// paste.
 public struct CanvasDragPan: Sendable {
     /// Screen points the pointer moves before a press becomes a pan.
     public static let threshold: CGFloat = 3

@@ -255,7 +255,7 @@ enum DevInput {
             // `--hold`: the button stays down (a shot of the gesture mid-drag); `release` ends it.
             if fields["hold"] == nil { mouse(middle ? .otherMouseUp : .leftMouseUp, end) }
         case "release":
-            mouse(.leftMouseUp, point("x", "y"))
+            mouse(fields["middle"] != nil ? .otherMouseUp : .leftMouseUp, point("x", "y"))
         case "flags":
             // Holding (or releasing) modifiers with the pointer at x,y: drives hover outlines.
             pointer = point("x", "y")

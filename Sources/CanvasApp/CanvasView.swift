@@ -151,8 +151,6 @@ final class CanvasView: NSScrollView {
     private var marquee: MarqueeGesture?
     /// A press on a drawn object is tracked here (the event never reaches a view).
     private var shapePress = false
-    /// A middle-button press on the board or a tile, and the press itself to hand on if it ends a click.
-    private var middlePan: (pan: CanvasDragPan, press: NSEvent)?
     private var mouseMonitor: Any?
     /// Terminals seen since their agent last started working (mirrors Board's seen set).
     private var seenLocally: Set<ObjectID> = []
@@ -304,8 +302,7 @@ final class CanvasView: NSScrollView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window, mouseMonitor == nil else { return }
-        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp,
-                                                                   .otherMouseDown, .otherMouseDragged, .otherMouseUp]) { [weak self] event in
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
             // Not `self?.handleMouse(event) ?? event`: that turns "consumed" (nil) back into the event.
             guard let self else { return event }
             return self.handleMouse(event)
@@ -738,30 +735,6 @@ final class CanvasView: NSScrollView {
             shapePress = false
             endMove(event)
             return nil
-
-        // Middle-drag pans the board from anywhere on it, tiles included (`CanvasDragPan`).
-        case .otherMouseDown where event.buttonNumber == 2:
-            guard let hit = hitView(event), hit.isDescendant(of: self) else { return event }
-            middlePan = (CanvasDragPan(at: event.locationInWindow), event)
-            return nil
-        case .otherMouseDragged where middlePan != nil:
-            let wasPanning = middlePan?.pan.panning == true
-            guard let delta = middlePan?.pan.move(to: event.locationInWindow) else { return nil }
-            if !wasPanning { NSCursor.closedHand.push() }
-            let origin = contentView.bounds.origin
-            scroll(to: NSPoint(x: origin.x - delta.width / magnification, y: origin.y - delta.height / magnification))
-            return nil
-        case .otherMouseUp where middlePan != nil && event.buttonNumber == 2:
-            guard let ended = middlePan else { return event }
-            middlePan = nil
-            if ended.pan.panning {
-                NSCursor.pop()
-                return nil
-            }
-
-            // A middle click that never moved: what's under it gets the press after all, then this release.
-            window?.sendEvent(ended.press)
-            return event
         default:
             return event
         }
@@ -1744,13 +1717,19 @@ final class CanvasView: NSScrollView {
         case .system:
             super.scrollWheel(with: event)
         case .pan(let dx, let dy):
-            let origin = contentView.bounds.origin
-            scroll(to: NSPoint(x: origin.x - dx / magnification, y: origin.y - dy / magnification))
+            pan(by: CGSize(width: dx, height: dy))
         case .zoom(let factor):
             // A window-less event (input replay) carries its screen location.
             let point = event.window == nil ? window?.convertPoint(fromScreen: event.locationInWindow) ?? event.locationInWindow : event.locationInWindow
             zoom(by: factor, around: contentView.convert(point, from: nil))
         }
+    }
+
+    /// Moves the content by `delta` screen points (positive y: down): a wheel notch, a middle-button
+    /// drag step (`CanvasWindow`).
+    func pan(by delta: CGSize) {
+        let origin = contentView.bounds.origin
+        scroll(to: NSPoint(x: origin.x - delta.width / magnification, y: origin.y - delta.height / magnification))
     }
 
     /// The zoom times `factor` (within the limits), keeping the document point `anchor` where it

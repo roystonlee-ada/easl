@@ -7,7 +7,7 @@
 //   dev-input <pid> mainmenu "<menu>/<item>"          perform a menu-bar item (e.g. "Edit/Send Mentions To/codex")
 //   dev-input <pid> drag <x> <y> <toX> <toY> [--mods …] [--hold] [--middle]   --hold: no mouse-up (shoot mid-drag);
 //                                                    --middle: with the middle button
-//   dev-input <pid> release <x> <y>                  the mouse-up ending a held drag
+//   dev-input <pid> release <x> <y> [--middle]       the mouse-up ending a held drag
 //   dev-input <pid> flags <x> <y> [--mods …]         hold modifiers with the pointer at x,y (hover); no --mods releases
 //   dev-input <pid> move <x> <y>                     move the pointer (tracking-area hover, e.g. code navigation)
 //   dev-input <pid> text "<string>"                  insert text into the first responder
