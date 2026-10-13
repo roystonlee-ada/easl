@@ -83,6 +83,7 @@ final class TerminalTile: NSView, TileContent {
         terminal.onFocusChange = { [weak self] in
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.updateSurfaceFocus() } }
         }
+        terminal.hasScrollback = { [weak self] in self?.scrollbar.map { $0.total > $0.len } ?? false }
         addSubview(terminal)
         underline.frame = bounds
         underline.autoresizingMask = [.width, .height]
