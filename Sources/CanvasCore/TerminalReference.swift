@@ -458,19 +458,20 @@ extension Board {
         codePreviews = codePreviews.filter { $0.value.tile != id }
     }
 
-    /// The page a reference ⌘-clicked in a terminal shows rendered instead of its source: an
-    /// `.html` or `.htm` file (`TerminalReferences.pageExtensions`) named without a line, by a
-    /// plain ⌘-click (`newTile`, ⌥⌘- or ⇧⌘-click, opens the source), in a terminal whose session
-    /// runs on this Mac (a hosted terminal's paths name its host's files, `hosted`), inside the
-    /// board root or a temp directory even after symlinks resolve (`LocalImage.confined`, the
-    /// rule notes and HTML tiles follow). A page runs its scripts in the shared browser profile
-    /// and reads its folder, so a file from anywhere else a program prints (`~/Downloads`,
-    /// `node_modules`) opens as code. Nil when the reference opens as code.
+    /// A plain local ⌘-click renders an HTML page inside the resolved board root or a temp
+    /// directory. A home-rooted board allows only temp directories. Dependency pages open as
+    /// code because rendered pages run scripts with the browser profile, network and folder access.
     public func referencePage(path: String, lines: LineRange?, newTile: Bool, hosted: Bool,
                               tempDirectories: [String] = FollowFilter.tempDirectories) -> URL? {
         guard !newTile, !hosted, lines == nil, TerminalReferences.pageExtensions.contains((path as NSString).pathExtension.lowercased()) else { return nil }
         let file = URL(fileURLWithPath: path).standardizedFileURL
-        return LocalImage.confined(file, root: root, tempDirectories: tempDirectories) == nil ? nil : file
+        let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.resolvingSymlinksInPath()
+        let directories = resolvedRoot == home ? tempDirectories : [resolvedRoot.path] + tempDirectories
+        guard let resolved = LocalImage.confined(file, directories: directories),
+              !file.pathComponents.contains("node_modules"),
+              !resolved.pathComponents.contains("node_modules") else { return nil }
+        return resolved
     }
 
     /// A reference the user ⌘-clicked in terminal `tile`: a page (`referencePage`) in a browser
@@ -484,20 +485,7 @@ extension Board {
         guard let page = referencePage(path: path, lines: lines, newTile: newTile, hosted: hosted, tempDirectories: tempDirectories) else {
             return .code(openCode(path: path, lines: lines, beside: tile, newTile: newTile))
         }
-        let address = WebLink.address(page)
-        let here = objects[tile]?.frame
-        let shown = objects.values.filter { object in
-            guard object.type == .browser, object.props["profile"] == nil,
-                  let url = object.props["url"]?.string.flatMap(URLComponents.init(string:)) else { return false }
-            var bare = url
-            bare.query = nil
-            bare.fragment = nil
-            return bare.url.flatMap(WebLink.address) == address
-        }
-        if let reused = shown.min(by: { (here.map($0.frame.centerDistance) ?? 0, $0.id) < (here.map($1.frame.centerDistance) ?? 0, $1.id) }) {
-            return .page(reused.id, url: page, existing: true)
-        }
-        let opened = openLink(page, near: tile, caller: tile)
+        let opened = openLink(page, near: tile, caller: tile, matchingFilePath: true)
         return .page(opened.object.id, url: page, existing: opened.existing)
     }
 }

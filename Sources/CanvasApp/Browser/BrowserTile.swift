@@ -127,8 +127,22 @@ final class BrowserTile: NSView, TileContent {
     private var pageWatch: (directory: URL, watch: LocalPageWatch)?
     /// A counted file change arrived while the page loaded: it reloads once that load ends.
     private var reloadPending = false
-    /// When the page last finished loading (`reloadIfFileChanged`).
-    private var loadedAt: Date?
+    private struct FileVersion {
+        let url: URL
+        let modified: Date
+
+        init?(_ url: URL?) {
+            guard let url, url.isFileURL else { return nil }
+            let file = URL(fileURLWithPath: url.path)
+            guard let modified = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else { return nil }
+            self.url = file
+            self.modified = modified
+        }
+    }
+    /// Sample before WebKit reads the document, not after its slow resources finish.
+    private var requestedFileVersion: FileVersion?
+    private var loadedFileVersion: FileVersion?
+    private var fileRefreshPending: URL?
 
     init(object: CanvasObject, board: Board) {
         self.board = board
@@ -367,8 +381,16 @@ final class BrowserTile: NSView, TileContent {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.chrome.isLoading = view.isLoading
-                    if !view.isLoading { self.commitURL() }
-                    if !view.isLoading, self.reloadPending { self.filesChanged() }
+                    if !view.isLoading {
+                        self.commitURL()
+                        if self.reloadPending {
+                            self.fileRefreshPending = nil
+                            self.filesChanged()
+                        } else if let pending = self.fileRefreshPending {
+                            self.fileRefreshPending = nil
+                            if pending == self.loadedFileVersion?.url { self.reloadIfFileChanged() }
+                        }
+                    }
                     self.signalChange()
                     BrowserExtensions.changed(self, .loading)
                 }
@@ -516,6 +538,9 @@ final class BrowserTile: NSView, TileContent {
         self.webView = nil
         pageWatch = nil
         reloadPending = false
+        requestedFileVersion = nil
+        loadedFileVersion = nil
+        fileRefreshPending = nil
         closeFind()
         pendingNavigations = []
         uncommittedNavigations = []
@@ -1153,14 +1178,11 @@ final class BrowserTile: NSView, TileContent {
         track(webView.reload())
     }
 
-    /// A terminal's ⌘-click found this tile showing its page: a file page whose file changed
-    /// since it loaded (an agent wrote the report again) loads again; otherwise the page, its
-    /// scroll and its state stay. A released page loads the file afresh when it comes back.
     func reloadIfFileChanged() {
-        guard let webView, !webView.isLoading, let loadedAt, let url = webView.url, url.isFileURL,
-              let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-              modified > loadedAt else { return }
-        NSLog("easl: browser %@ reloading: %@ changed since it loaded", objectID, url.path)
+        guard let webView, let current = FileVersion(webView.url) else { return }
+        guard !webView.isLoading else { return fileRefreshPending = current.url }
+        guard let loaded = loadedFileVersion, current.url == loaded.url, current.modified != loaded.modified else { return }
+        NSLog("easl: browser %@ reloading: %@ changed since it loaded", objectID, current.url.path)
         credit.user()
         track(webView.reload())
     }
@@ -1298,6 +1320,10 @@ extension BrowserTile: WKNavigationDelegate, WKUIDelegate {
             if navigationAction.targetFrame?.isMainFrame != false { openInOtherApp(url, from: navigationAction.sourceFrame) }
             if NSWorkspace.shared.urlForApplication(toOpen: url) != nil { return decisionHandler(.cancel) }
         }
+        if navigationAction.targetFrame?.isMainFrame == true, !navigationAction.shouldPerformDownload {
+            requestedFileVersion = FileVersion(url)
+            if fileRefreshPending != requestedFileVersion?.url { fileRefreshPending = nil }
+        }
         decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
     }
 
@@ -1331,6 +1357,7 @@ extension BrowserTile: WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         uncommittedNavigations.removeAll { $0 === navigation }
+        loadedFileVersion = requestedFileVersion
         clearLoadFailure()
         commitURL()
         // The committed document's own HTTP error, or none; a page back from the back/forward
@@ -1345,7 +1372,6 @@ extension BrowserTile: WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        loadedAt = Date()
         finished(navigation)
         commitURL()
         scheduleSnapshotRefresh()

@@ -482,8 +482,6 @@ final class CanvasView: NSScrollView {
                 }
                 self.recordNavigation(from: from, reaim: opened.reaim, landing: self.board.objects[opened.id].flatMap(CodeAim.init))
             }
-            // A ⌘-clicked page: the same navigation, and a page already shown whose file changed
-            // since it loaded loads again.
             terminal.onOpenedPage = { [weak self] opened, existing, source in
                 guard let self else { return }
                 let from = self.viewport

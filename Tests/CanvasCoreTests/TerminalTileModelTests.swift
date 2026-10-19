@@ -248,9 +248,12 @@ struct TerminalBoardTests {
     @Test func aPageNamedWithoutALineOpensRenderedInsideTheRootOrATempDirectory() throws {
         let board = makeBoard()
         let terminal = board.create(type: .terminal, props: .object([:]))
-        let scratch = root.appendingPathComponent("scratch"), elsewhere = root.deletingLastPathComponent().appendingPathComponent("elsewhere-\(UUID().uuidString)")
+        let scratch = root.deletingLastPathComponent().appendingPathComponent("scratch-\(UUID().uuidString)")
+        let elsewhere = root.deletingLastPathComponent().appendingPathComponent("elsewhere-\(UUID().uuidString)")
         for directory in [scratch, elsewhere, root.appendingPathComponent("out")] { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
-        defer { try? FileManager.default.removeItem(at: elsewhere) }
+        defer {
+            for directory in [root, scratch, elsewhere] { try? FileManager.default.removeItem(at: directory) }
+        }
         try "<p>x</p>".write(to: elsewhere.appendingPathComponent("page.html"), atomically: true, encoding: .utf8)
         try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("out/link.html"), withDestinationURL: elsewhere.appendingPathComponent("page.html"))
         // The root is itself in the temp directory: only the root and `scratch` count here.
@@ -258,8 +261,12 @@ struct TerminalBoardTests {
             board.referencePage(path: path, lines: lines, newTile: newTile, hosted: hosted, tempDirectories: [scratch.path])
         }
         let report = root.appendingPathComponent("out/report.html").path
-        #expect(page(report) == URL(fileURLWithPath: report))
-        #expect(page(root.appendingPathComponent("out/./old.HTM").path) == URL(fileURLWithPath: root.appendingPathComponent("out/old.HTM").path), ".htm too, standardized")
+        try "<h1>Report</h1>".write(toFile: report, atomically: true, encoding: .utf8)
+        let alias = elsewhere.appendingPathComponent("alias.html")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: URL(fileURLWithPath: report))
+        #expect(page(alias.path) == URL(fileURLWithPath: report).resolvingSymlinksInPath())
+        #expect(page(report) == URL(fileURLWithPath: report).resolvingSymlinksInPath())
+        #expect(page(root.appendingPathComponent("out/./old.HTM").path) == root.appendingPathComponent("out/old.HTM").resolvingSymlinksInPath(), ".htm too, standardized")
         #expect(page(scratch.appendingPathComponent("chart.html").path) != nil, "a temp directory")
         #expect(page(report, lines: LineRange(start: 12, end: 12)) == nil, "a line: its source")
         #expect(page(report, newTile: true) == nil, "⌥⌘- or ⇧⌘-click: its source")
@@ -268,20 +275,37 @@ struct TerminalBoardTests {
         #expect(page(root.appendingPathComponent("out/../../\(elsewhere.lastPathComponent)/page.html").path) == nil, "..")
         #expect(page(root.appendingPathComponent("out/link.html").path) == nil, "a symlink that leads out")
         #expect(page(root.appendingPathComponent("out/report.ts").path) == nil)
+        #expect(page(root.appendingPathComponent("node_modules/package/index.html").path) == nil)
 
         func open(_ path: String, lines: LineRange? = nil) -> ReferenceOpened {
             board.openReference(path: path, lines: lines, beside: terminal.id, tempDirectories: [scratch.path])
         }
-        guard case let .page(tile, url, existing) = open(report) else { Issue.record("not a page"); return }
-        #expect(!existing && url.isFileURL)
+        guard case let .page(tile, url, existing) = open(alias.path) else { Issue.record("not a page"); return }
+        #expect(!existing && url == URL(fileURLWithPath: report).resolvingSymlinksInPath())
         #expect(board.objects[tile]?.type == .browser && board.objects[tile]?.createdBy == Actor(caller: terminal.id))
+        #expect(board.objects[tile]?.props["url"]?.string == url.absoluteString)
         #expect(open(report) == .page(tile, url: url, existing: true), "a second click finds it")
+        #expect(open(alias.path) == .page(tile, url: url, existing: true), "an outside alias loads the checked URL")
         _ = try board.update(tile, props: .object(["url": .string(url.absoluteString + "#appendix")]))
         #expect(open(report) == .page(tile, url: url, existing: true), "also once the page went to an anchor")
         guard case .code(let code) = open(report, lines: LineRange(start: 3, end: 3)) else { Issue.record("not code"); return }
         #expect(code.created && board.objects[code.id]?.props["path"]?.string == "out/report.html")
         guard case .code = open(elsewhere.appendingPathComponent("page.html").path) else { Issue.record("outside, not code"); return }
         #expect(board.objects.values.filter { $0.type == .browser }.count == 1)
+    }
+
+    @Test func aHomeRootedBoardRendersOnlyTemporaryPages() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let board = Board(id: "brd_home_page", root: home)
+        let scratch = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("page-tests")
+        func page(_ file: URL) -> URL? {
+            board.referencePage(path: file.path, lines: nil, newTile: false, hosted: false, tempDirectories: [scratch.path])
+        }
+        #expect(page(home.appendingPathComponent("report.html")) == nil)
+        #expect(page(home.appendingPathComponent("Downloads/report.html")) == nil)
+        #expect(page(home.appendingPathComponent("node_modules/report.html")) == nil)
+        #expect(page(scratch.appendingPathComponent("report.html")) == scratch.appendingPathComponent("report.html").resolvingSymlinksInPath())
+        #expect(page(scratch.appendingPathComponent("node_modules/package/report.html")) == nil)
     }
 
     @Test func openCodeIgnoresFollowTiles() throws {

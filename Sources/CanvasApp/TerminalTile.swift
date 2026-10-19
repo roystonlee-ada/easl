@@ -25,12 +25,7 @@ final class TerminalTile: NSView, TileContent {
     /// A ⌘-clicked reference opened this code tile (`created`) or re-aimed or found it there;
     /// `source` is the reference's rect in window coordinates.
     var onOpenedCode: ((CodeOpened, _ source: NSRect) -> Void)?
-    /// A ⌘-clicked reference to a page (`Board.referencePage`) opened this browser tile, or found
-    /// it already showing the page (`existing`); `source` as for `onOpenedCode`.
     var onOpenedPage: ((ObjectID, _ existing: Bool, _ source: NSRect) -> Void)?
-    /// A web link the terminal's text activated (a ⌘-click on an http(s) URL Ghostty found)
-    /// opened or found this browser tile; the canvas shows it. A ⌘-clicked page path is a
-    /// reference (`onOpenedPage`), not a link.
     var onOpenedLink: ((ObjectID) -> Void)?
     var onNotice: ((String) -> Void)?
     /// A remote board's terminal (docs/design.md "Client mode"): the host's session, attached
@@ -1196,7 +1191,7 @@ final class TerminalTile: NSView, TileContent {
         }
         let runs = grid.map { rects(hit.runs, grid: $0).reduce(NSRect.null) { $0.union($1) } } ?? .null
         let source = runs.isNull ? .null : underline.convert(runs, to: nil)
-        switch board.openReference(path: hit.file, lines: hit.lines, beside: objectID, newTile: newTile, hosted: isRemote) {
+        switch board.openReference(path: hit.file, lines: hit.lines, beside: objectID, newTile: newTile, hosted: isRemote || host != nil) {
         case .code(let opened):
             if !isRemote {
                 NSLog("easl: terminal %@ opened %@%@ as %@ (%@)", objectID, hit.file, hit.lines.map { ":\($0.start)-\($0.end)" } ?? "", opened.id,

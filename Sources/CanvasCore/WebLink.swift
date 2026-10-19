@@ -121,15 +121,24 @@ extension Board {
     /// page) is returned as it is (`existing`) and nothing is created; otherwise a browser tile
     /// with that `url` and `props` is placed beside `source`
     /// (`place`) and credited to `caller`. Only http(s) and `file:` addresses are matched.
+    /// `matchingFilePath` lets a terminal reference reuse a file page at any query or fragment.
     @discardableResult
-    public func openLink(_ url: URL, near source: ObjectID?, caller: ObjectID?, props: [String: JSONValue] = [:]) -> (object: CanvasObject, existing: Bool) {
-        let address = WebLink.address(url)
+    public func openLink(_ url: URL, near source: ObjectID?, caller: ObjectID?, props: [String: JSONValue] = [:],
+                         matchingFilePath: Bool = false) -> (object: CanvasObject, existing: Bool) {
+        func address(_ url: URL) -> String? {
+            guard matchingFilePath, url.isFileURL,
+                  var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return WebLink.address(url) }
+            parts.query = nil
+            parts.fragment = nil
+            return parts.url.flatMap(WebLink.address)
+        }
+        let wanted = address(url)
         let here = source.flatMap { objects[$0]?.frame }
         let machine = props["drawingMachine"]?["id"]?.string
-        let shown = address == nil ? [] : objects.values.filter { object in
+        let shown = wanted == nil ? [] : objects.values.filter { object in
             object.type == .browser && object.props["profile"]?.string == props["profile"]?.string
                 && (machine == nil || DrawingMachine(object.props)?.id == machine)
-                && object.props["url"]?.string.flatMap(URL.init(string:)).flatMap(WebLink.address) == address
+                && object.props["url"]?.string.flatMap(URL.init(string:)).flatMap(address) == wanted
         }
         // Several tiles can show one address (the user made a second on purpose): the nearest.
         if let reused = shown.min(by: { (here.map($0.frame.centerDistance) ?? 0, $0.id) < (here.map($1.frame.centerDistance) ?? 0, $1.id) }) {
