@@ -35,7 +35,6 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     private var messageWork: DispatchWorkItem?
     private let cache = ChangesLineCache()
     private var filterField: NSSearchField?
-    /// Who the trackpad gesture under way scrolls: the tile never hands one to the canvas halfway.
     private var gesture = ScrollGesture()
     private var toolTipWork: DispatchWorkItem?
     /// The rows of the last painter and what they were laid out for: stepping through hunks or

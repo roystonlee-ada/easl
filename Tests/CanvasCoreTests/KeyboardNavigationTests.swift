@@ -3,7 +3,6 @@ import Foundation
 import Testing
 import CanvasCore
 
-/// Keyboard zoom steps, the mouse wheel and trackpad gestures over tiles, ⌥⌘-arrow neighbors, Go to's file matching, and the tray's prompt target.
 struct KeyboardNavigationTests {
     @Test func keyboardZoomStepsThroughBrowserLevelsWithinTheLimits() {
         let limits: ClosedRange<CGFloat> = 0.1...1

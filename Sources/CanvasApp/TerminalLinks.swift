@@ -426,7 +426,6 @@ final class CanvasTerminalView: TerminalView {
 
     private var swallowedMouseUp = false
     private var hovered: TerminalReferences.Hit?
-    /// Who the trackpad gesture under way scrolls (`scrollWheel`).
     private var gesture = ScrollGesture()
     /// AppKit takes keyboard focus from a view it hides, and a terminal is hidden whenever its
     /// tile turns into its card (panned offscreen, zoomed out, a resize that took it out of
@@ -531,21 +530,18 @@ final class CanvasTerminalView: TerminalView {
         super.mouseUp(with: forcingDefaultBrowser ? Self.commandOnly(event) : event)
     }
 
-    /// Vertical scrolling over the terminal stays with it, focused or not, and a sideways step
-    /// (`CanvasWheel.sideways`, a ⇧-wheel too) pans the canvas; a trackpad gesture keeps the
-    /// owner its first movement chose (`ScrollGesture`). Ghostty gets the scroll (its scrollback,
-    /// or a program that reads the mouse) unless the terminal lacks keyboard focus, the program
-    /// hasn't captured the mouse and there is no scrollback: Ghostty would type ↑/↓ into a
-    /// full-screen program then (alternate scroll), so the scroll does nothing. Click in first.
+    /// Ghostty's alternate-scroll mode types arrow keys into a full-screen program without
+    /// mouse reporting. An unfocused terminal must not receive those keys.
     override func scrollWheel(with event: NSEvent) {
         let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
         let sideways = CanvasWheel.sideways(dx: dx, dy: dy, precise: event.hasPreciseScrollingDeltas, shift: event.modifierFlags.contains(.shift))
-        var owner: ScrollGesture.Owner = sideways ? .canvas : .tile
+        let owner: ScrollGesture.Owner?
         if let step = ScrollGesture.Step(event) {
-            // A gesture's first event without movement stays here: the canvas mustn't start
-            // tracking a gesture that may turn out to be the terminal's.
-            owner = gesture.owner(of: step, sequence: (window as? CanvasWindow)?.scrollSequence ?? 0, dx: dx, dy: dy, tileTakes: !sideways) ?? .tile
+            owner = gesture.owner(of: step, sequence: (window as? CanvasWindow)?.scrollSequence ?? 0, dx: dx, dy: dy, tileTakes: !sideways)
+        } else {
+            owner = sideways ? .canvas : .tile
         }
+        guard let owner else { return }
         if owner == .canvas {
             nextResponder?.scrollWheel(with: event)
             return
