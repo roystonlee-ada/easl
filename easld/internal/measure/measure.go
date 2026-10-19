@@ -28,8 +28,7 @@ func (e *NotPorted) Error() string { return e.What + " is not ported to easld" }
 // scales images; a zoomed tile lays out at width / zoom and measures zoom times that under a 1×
 // title bar. Text AppKit lays out (notes, text shapes and labelled rects/ellipses, a code tile's
 // caption) is measured by texts; approximate says the glyph table measured it. Errors are
-// *Failure, *NeedsApp for what only the app measures (HTML, image formats ImageIO alone
-// reads), or *NotPorted (changes tiles).
+// *Failure, *NeedsApp for image formats ImageIO alone reads, or *NotPorted (changes tiles).
 func Size(typ model.ObjectType, props map[string]any, width *float64, root string, texts Texts) (w, h float64, approximate bool, err error) {
 	zoom := 1.0
 	if ZoomApplies(typ) {
@@ -73,7 +72,7 @@ func Size(typ model.ObjectType, props map[string]any, width *float64, root strin
 		}
 		return 0, 0, false, &Failure{"invalid_params", "shape props need a kind"}
 	case model.HTML:
-		return 0, 0, false, &NeedsApp{What: "an html page"}
+		return 0, 0, false, &Failure{"unavailable", "an html page is measured by the app"}
 	case model.Changes:
 		return 0, 0, false, &NotPorted{What: "measuring a changes tile (ChangeSet.load + ChangesMetrics)"}
 	case model.Image:
@@ -197,9 +196,9 @@ func CodeRowsSize(lines []string, fileLineCount int, caption, follow bool, maxWi
 }
 
 // Reanchor is the code tile's anchor write-back (CodeTile.reanchor → Board.reanchor) done
-// server-side: the range resolved against the file as the tile shows it, and its first line;
-// changed false when the tile doesn't anchor, the file is empty or gone, the range is stale, or
-// nothing moved.
+// server-side: the range resolved against a policy-authorized source, and its first line;
+// changed false when the tile doesn't anchor, the source is refused, empty or gone, the range
+// is stale, or nothing moved. Display reads remain intentionally broader.
 func Reanchor(props map[string]any, root string) (rng model.LineRange, anchor *string, changed bool) {
 	fence, ok := CodeAnchorFence(props)
 	if !ok {
@@ -215,7 +214,11 @@ func Reanchor(props map[string]any, root string) (rng model.LineRange, anchor *s
 		fence = source.Fence(fence)
 		readRoot = source.Root
 	}
-	text, err := ReadSource(*fence.Path, fence.Commit, readRoot)
+	areas := boardAreas(root)
+	if areaOf(areas, readRoot) == nil {
+		return model.LineRange{}, nil, false
+	}
+	text, err := readNoteFile(*fence.Path, fence.Commit, readRoot, areas)
 	if err != nil || len(SideLines(text)) == 0 {
 		return model.LineRange{}, nil, false
 	}

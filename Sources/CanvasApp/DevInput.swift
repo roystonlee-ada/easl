@@ -1,5 +1,6 @@
 import AppKit
 import CanvasCore
+import CryptoKit
 
 /// Development input replay (`EASL_DEV_INPUT=1`, driven by `scripts/dev-input.swift`).
 /// Agents test the UI while the window sits on a Space nobody is viewing, where real HID input
@@ -73,6 +74,24 @@ enum DevInput {
         return view.subviews.lazy.compactMap { button(in: $0, keyEquivalent: key) }.first
     }
 
+    private static func performMenu(_ menu: NSMenu?, path: String) {
+        var menu = menu
+        var titles = path.replacingOccurrences(of: "//", with: "\u{0}").split(separator: "/").map { $0.replacingOccurrences(of: "\u{0}", with: "/") }
+        while let current = menu, !titles.isEmpty {
+            current.delegate?.menuNeedsUpdate?(current)
+            current.update()
+            let title = titles.removeFirst()
+            guard let index = current.items.firstIndex(where: { $0.title == title }) else {
+                return NSLog("DevInput: no menu item %@ in [%@]", title, current.items.map(\.title).joined(separator: ", "))
+            }
+            if titles.isEmpty {
+                if current.items[index].isEnabled { current.performActionForItem(at: index) }
+            } else {
+                menu = current.items[index].submenu
+            }
+        }
+    }
+
     static func replay(_ fields: [String: String]) {
         guard fields["pid"] == String(getpid()) else { return }
         // `--repeat N --interval ms`: a burst like a trackpad's event stream. The log line reports
@@ -139,18 +158,75 @@ enum DevInput {
             let ms = Double(fields["ms"] ?? "") ?? 2000
             return Metrics.shared.span("dev", "dev.stall") { Thread.sleep(forTimeInterval: ms / 1000) }
         }
+        if fields["kind"] == "state" {
+            func fingerprint(_ data: Data) -> String {
+                SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            func selectedText(in view: NSView) -> [String] {
+                if let text = view as? NSTextView, !text.isHiddenOrHasHiddenAncestor {
+                    return text.selectedRanges.compactMap { value in
+                        let range = value.rangeValue
+                        return range.length > 0 && NSMaxRange(range) <= (text.string as NSString).length
+                            ? (text.string as NSString).substring(with: range) : nil
+                    }
+                }
+                if let rows = view as? CodeRowsView, let text = rows.selectedText { return [text] }
+                if let question = view as? QuestionTile, let text = question.selectedText { return [text] }
+                return view.subviews.flatMap { selectedText(in: $0) }
+            }
+            let windows: [JSONValue] = NSApp.windows.compactMap { window in
+                guard let controller = window.windowController as? CanvasWindowController else { return nil }
+                return .object([
+                    "window": .number(Double(window.windowNumber)),
+                    "board": .string(controller.board.id),
+                    "closed": .bool(controller.hostBoardClosed),
+                    "selected": .bool(window.tabGroup?.selectedWindow === window || window.tabGroup == nil),
+                    "selectedObjects": .array(controller.canvas.selection.sorted().map(JSONValue.string)),
+                    "viewport": controller.canvas.viewport.json,
+                    "responder": .string(window.firstResponder.map { String(describing: type(of: $0)) } ?? ""),
+                    "selectedTextHashes": .array(window.contentView.map { selectedText(in: $0).map { .string(fingerprint(Data($0.utf8))) } } ?? []),
+                    "objects": .array(controller.board.snapshot.objects.sorted { $0.id < $1.id }.compactMap { object in
+                        guard let data = try? encoder.encode(object) else { return nil }
+                        return .object(["id": .string(object.id), "hash": .string(fingerprint(data))])
+                    }),
+                ])
+            }
+            if let data = try? JSONEncoder().encode(JSONValue.array(windows)) {
+                NSLog("DevInput.state %@", String(decoding: data, as: UTF8.self))
+            }
+            return
+        }
         if fields["kind"] == "remote", let target = fields["target"], let board = fields["board"] {
             // Opens another easl's board as a remote board (`AppDelegate.openRemoteBoard`), its
-            // host found over ssh; `home` is the host's support directory (a development instance).
+            // host found over ssh; `home` is the host's support directory (a development instance),
+            // else `EASL_DEV_REMOTE_HOME`'s, as File › Open Remote… finds it.
             Task { @MainActor in
                 do {
-                    let host = try await RemoteHost.discover(name: target, sshTarget: target, support: fields["home"])
+                    let host = try await RemoteHost.discover(name: target, sshTarget: target, support: fields["home"] ?? AppPaths.devRemoteHome,
+                                                            allowDefault: AppPaths.devRemoteHome == nil)
                     (NSApp.delegate as? AppDelegate)?.openRemoteBoard(host: host, board: board)
                 } catch {
                     NSLog("DevInput: remote %@ not found: %@", target, BoardMirror.reason(error))
                 }
             }
             return
+        }
+        if fields["kind"] == "close", let number = Int(fields["window"] ?? "") {
+            guard let window = NSApp.window(withWindowNumber: number) else {
+                return NSLog("DevInput: no window %d", number)
+            }
+            window.performClose(nil)
+            return
+        }
+        if fields["kind"] == "reopen" {
+            let visible = NSApp.windows.contains { $0.isVisible && $0.alphaValue > 0 }
+            _ = (NSApp.delegate as? AppDelegate)?.applicationShouldHandleReopen(NSApp, hasVisibleWindows: visible)
+            return
+        }
+        if fields["kind"] == "mainmenu" {
+            return performMenu(NSApp.mainMenu, path: fields["path"] ?? "")
         }
         guard let window = CanvasWindowController.frontmost?.window, let content = window.contentView else { return }
         let flags = modifiers(fields["mods"])
@@ -160,8 +236,13 @@ enum DevInput {
             window.contentView!.convert(NSPoint(x: number(x), y: content.bounds.height - number(y)), to: nil)
         }
         func mouse(_ type: NSEvent.EventType, _ at: NSPoint, clicks: Int = 1) {
-            let event = NSEvent.mouseEvent(with: type, location: at, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+            var event = NSEvent.mouseEvent(with: type, location: at, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
                                            windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
+            // NSEvent can't name an other-button's number; its CGEvent can.
+            if [.otherMouseDown, .otherMouseDragged, .otherMouseUp].contains(type), let cg = event.cgEvent {
+                cg.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+                event = NSEvent(cgEvent: cg) ?? event
+            }
             NSApp.postEvent(event, atStart: false)
         }
         switch fields["kind"] {
@@ -176,32 +257,13 @@ enum DevInput {
             let at = point("x", "y")
             mouse(.rightMouseDown, at)
             mouse(.rightMouseUp, at)
-        case "menu", "mainmenu":
-            // A shown context menu runs a tracking loop posted events can't drive: build the menu
-            // a right-click at x,y would show (the hit view, then its superviews), or for
-            // `mainmenu` take the menu bar, and perform the item at `path`, titles separated by
-            // "/" (e.g. "Content Zoom/150%", "Edit/Send Mentions To/codex"; "//" is a slash in a
-            // title: "Review Changes/Branch vs origin//main"). Submenus filled as they open
-            // (their delegate's `menuNeedsUpdate`) are filled first.
-            var menu: NSMenu?
-            if fields["kind"] == "mainmenu" {
-                menu = NSApp.mainMenu
-            } else {
-                let at = point("x", "y")
-                guard let frame = content.superview, let hit = content.hitTest(frame.convert(at, from: nil)),
-                      let event = NSEvent.mouseEvent(with: .rightMouseDown, location: at, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
-                                                     windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else { return }
-                menu = CodeNavigation.menu(for: event) ?? sequence(first: hit, next: \.superview).lazy.compactMap { $0.menu(for: event) }.first
-            }
-            var titles = (fields["path"] ?? "").replacingOccurrences(of: "//", with: "\u{0}").split(separator: "/").map { $0.replacingOccurrences(of: "\u{0}", with: "/") }
-            while let current = menu, !titles.isEmpty {
-                current.delegate?.menuNeedsUpdate?(current)
-                let title = titles.removeFirst()
-                guard let index = current.items.firstIndex(where: { $0.title == title }) else {
-                    return NSLog("DevInput: no menu item %@ in [%@]", title, current.items.map(\.title).joined(separator: ", "))
-                }
-                if titles.isEmpty { current.performActionForItem(at: index) } else { menu = current.items[index].submenu }
-            }
+        case "menu":
+            let at = point("x", "y")
+            guard let frame = content.superview, let hit = content.hitTest(frame.convert(at, from: nil)),
+                  let event = NSEvent.mouseEvent(with: .rightMouseDown, location: at, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                                                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else { return }
+            let menu = CodeNavigation.menu(for: event) ?? sequence(first: hit, next: \.superview).lazy.compactMap { $0.menu(for: event) }.first
+            performMenu(menu, path: fields["path"] ?? "")
         case "move":
             // Tracking-area events come from the window server; a posted mouseMoved never reaches
             // their owners. Deliver them to the areas under the point directly: mouseMoved, and
@@ -241,15 +303,16 @@ enum DevInput {
         case "drag":
             let start = point("x", "y")
             let end = point("toX", "toY")
-            mouse(.leftMouseDown, start)
+            let middle = fields["middle"] != nil
+            mouse(middle ? .otherMouseDown : .leftMouseDown, start)
             for step in 1...8 {
                 let t = CGFloat(step) / 8
-                mouse(.leftMouseDragged, NSPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t))
+                mouse(middle ? .otherMouseDragged : .leftMouseDragged, NSPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t))
             }
             // `--hold`: the button stays down (a shot of the gesture mid-drag); `release` ends it.
-            if fields["hold"] == nil { mouse(.leftMouseUp, end) }
+            if fields["hold"] == nil { mouse(middle ? .otherMouseUp : .leftMouseUp, end) }
         case "release":
-            mouse(.leftMouseUp, point("x", "y"))
+            mouse(fields["middle"] != nil ? .otherMouseUp : .leftMouseUp, point("x", "y"))
         case "flags":
             // Holding (or releasing) modifiers with the pointer at x,y: drives hover outlines.
             pointer = point("x", "y")

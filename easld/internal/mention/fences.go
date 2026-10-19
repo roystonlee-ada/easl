@@ -45,7 +45,7 @@ func AnchoredFences(markdown string) []AnchoredFence {
 func resolveFences(fences []AnchoredFence, reading measure.LinkReading) map[string]measure.Excerpt {
 	results := map[string]measure.Excerpt{}
 	for _, f := range fences {
-		results[f.Key] = measure.ExcerptFor(reading.Fence(f.Fence), reading.Root, nil, f.Body)
+		results[f.Key] = reading.NoteExcerpt(f.Fence, f.Body)
 	}
 	return results
 }
@@ -88,8 +88,9 @@ func needsAnchor(f AnchoredFence) bool {
 	return f.Fence.Lines != nil && f.Fence.Anchor == nil && f.Fence.Symbol == nil && f.Fence.Commit == nil
 }
 
-// AnchoringRanges is NoteMarkdown.anchoringRanges(_:reading:): markdown with each unanchored
-// line-range fence anchored at its resolved first line, as the note tile writes them back.
+// AnchoringRanges is NoteMarkdown.anchoringRanges(_:reading:within:captured:): markdown with
+// each unanchored line-range fence anchored at its resolved first line, as the note tile writes
+// them back. The board areas, not the link root, decide which files may be read.
 func AnchoringRanges(markdown string, reading measure.LinkReading) string {
 	var fences []AnchoredFence
 	for _, f := range AnchoredFences(markdown) {
@@ -112,6 +113,37 @@ func AnchoringRanges(markdown string, reading measure.LinkReading) string {
 		}
 	}
 	return text
+}
+
+// ScrubRefusedAnchors removes only metadata tokens from policy-refused opening fences.
+// The AST identifies fences; decoded token boundaries map back to the original bytes.
+func ScrubRefusedAnchors(markdown string, reading measure.LinkReading) string {
+	d := parseMarkdown(markdown)
+	var out strings.Builder
+	end := 0
+	for _, block := range d.codeBlocks() {
+		anchors := measure.FenceAnchorRanges(block.info)
+		if len(anchors) == 0 {
+			continue
+		}
+		fence := measure.ParseFenceInfo(block.info)
+		if fence.Mode() == measure.FenceFree || !reading.RefusesFence(fence) {
+			continue
+		}
+		var offsets []int
+		decodeInlineMapped(d.source[block.infoStart:block.infoEnd], &offsets)
+		for _, anchor := range anchors {
+			start := block.infoStart + offsets[anchor.Start]
+			stop := block.infoStart + offsets[anchor.End]
+			out.WriteString(markdown[end:start])
+			end = stop
+		}
+	}
+	if end == 0 {
+		return markdown
+	}
+	out.WriteString(markdown[end:])
+	return out.String()
 }
 
 // anchoring is NoteMarkdown.anchoring: ` anchor="…"` appended to the opening fence lines.

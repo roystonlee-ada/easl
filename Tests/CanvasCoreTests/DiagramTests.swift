@@ -567,6 +567,77 @@ final class DiagramTests {
         #expect(reloaded["result"]?["loaded"] == .bool(false), "\(reloaded)")
         await late.stopAll()
     }
+
+    @Test func aMacHostPublishesALateTransportFailureAfterTheReloadWaitEnds() async throws {
+        let release = dir.appendingPathComponent(".release-failing-server")
+        let started = dir.appendingPathComponent(".failing-server-started")
+        let failing = LanguageService(configs: [
+            LanguageServerConfig(language: "swift", command: "/bin/sh",
+                                 arguments: ["-c", "touch \"$1\"; while [ ! -f \"$0\" ]; do sleep 0.01; done; exit 1", release.path, started.path],
+                                 languageIDs: ["swift": "swift"], rootMarkers: ["Package.swift"])
+        ])
+        defer { Task { await failing.stopAll() } }
+        let previous = try await build(Self.callers)
+        let (board, _, server, client) = try api(failing)
+        defer { server.stop() }
+        let diagram = board.create(type: .diagram, props: .object([
+            "path": "Sources/Lib/Spool.swift", "symbol": "Spool.read", "direction": "incoming", "depth": 1, "graph": previous.json
+        ]))
+        let forward = board.onEvent
+        var updates: [CanvasObject] = []
+        board.onEvent = { event in
+            forward?(event)
+            if case .objectUpdated(let object) = event, object.id == diagram.id { updates.append(object) }
+        }
+        client.send(#"{"id":"reload","method":"object.reload","params":{"id":"\#(diagram.id)","timeoutMs":0}}"#)
+        let reply = try await client.next()
+        #expect(reply["ok"] == .bool(true) && reply["result"]?["loaded"] == .bool(false), "\(reply)")
+        #expect(board.objects[diagram.id]?.props["graph"] == previous.json)
+        #expect(updates.isEmpty)
+        for _ in 0..<200 where !FileManager.default.fileExists(atPath: started.path) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(FileManager.default.fileExists(atPath: started.path))
+        try "".write(to: release, atomically: true, encoding: .utf8)
+        for _ in 0..<200 where updates.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        await failing.stopAll()
+        let published = try #require(updates.first)
+        var expected = previous
+        expected.error = "sh exited with status 1. It restarts on the next request."
+        let graph = try #require(DiagramGraph(published.props["graph"]))
+        expected.computedAt = graph.computedAt
+        #expect(graph == expected)
+        #expect(published.rev == diagram.rev && published.updatedAt == diagram.updatedAt && published.updatedBy == diagram.updatedBy)
+        #expect(board.objects[diagram.id]?.props["graph"] == graph.json)
+    }
+
+
+    @Test func aViewerComputesEasldsCopyOfADiagramNotItsOwnPreview() async throws {
+        let host = DelegatedCallsTests.NoHost()
+        let board = Board(remote: "brd_host", root: dir, host: host)
+        let easlds = CanvasObject(id: "obj_calls", type: .diagram, frame: Frame(x: 0, y: 0, w: 800, h: 500), z: 0, rev: 4, createdBy: .user, createdAt: Date(),
+                                  props: .object(["kind": "calls", "path": "Sources/Lib/Spool.swift", "symbol": "Spool.read", "direction": "incoming", "depth": 1]))
+        board.applyHost(easlds)
+        try board.update(easlds.id, props: .object(["symbol": "Registry.replay"]))
+        let calls = DelegatedCalls(board: board, window: ViewerWindow(
+            focused: { false }, viewState: { nil },
+            render: { _, _ in throw ApiRouter.Failure("unavailable", "no canvas") }, hostPicture: { _ in false },
+            measureHTML: { _, _ in throw ApiRouter.Failure("unavailable", "no page") },
+            reload: { _, _, _ in throw ApiRouter.Failure("unavailable", "no browser") },
+            browse: { _, _, _ in throw ApiRouter.Failure("unavailable", "no browser") },
+            submit: { _, _ in false }, surfaceTail: { _, _ in nil },
+            block: { _, _ in throw ApiRouter.Failure("unavailable", "no command has finished") }, status: { _ in nil }, languages: { [service] in service }))
+
+        let answer = try await calls.answer(EaslConnection.Call(method: "object.reload", params: .object(["id": "obj_calls", "_diagram": try JSONValue.encode(easlds)]))).get()
+        #expect(answer["id"] == "obj_calls" && answer["loaded"] == .bool(true) && answer["rev"] == 4)
+        let graph = try #require(DiagramGraph(answer["graph"]))
+        #expect(graph.root == Self.root)
+        #expect(graph.nodes.filter { $0.level == -1 }.map(\.id) == [Self.replay, Self.relaunch, Self.warm])
+
+        let unsnapshotted = await calls.answer(EaslConnection.Call(method: "object.reload", params: .object(["id": "obj_calls"])))
+        guard case .failure(let failure) = unsnapshotted else { Issue.record("a diagram without the host snapshot was computed"); return }
+        #expect(failure.code == "unavailable")
+    }
 }
 
 /// The pan after a user opens a diagram node (`Layout.revealGrown`): a viewport 1000 × 800 at

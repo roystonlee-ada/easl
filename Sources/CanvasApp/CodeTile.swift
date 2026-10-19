@@ -30,8 +30,10 @@ final class CodeTile: NSView, TileContent {
     private var flashTimer: Timer?
 
     private var isLive = true
+    private var hostBoardClosed = false
     private var needsLoad = true
     private var loadTask: Task<Void, Never>?
+    private var anchorTask: Task<Void, Never>?
     /// Bumped by every load; only the newest load installs its result.
     private var generation = 0
     /// Repository this tile holds in the git engine while live (bases watched).
@@ -52,11 +54,23 @@ final class CodeTile: NSView, TileContent {
     /// The repository whose default branch the base picker last read, and that branch.
     private var knownDefaultBranch: (repository: String, branch: String?)?
 
+    private let git: HostGit?
+    private var hostWatch: HostFileWatch?
+    private var hostRetry: Task<Void, Never>?
+    private var hostDefaultBranch: String?
+    private var hostRefShas: [String: String] = [:]
+    private enum HostFailure {
+        case retained(String)
+        case unavailable
+    }
+    private var hostFailure: HostFailure?
+
     static let flashDuration: TimeInterval = 3
 
-    init(object: CanvasObject, board: Board) {
+    init(object: CanvasObject, board: Board, git: HostGit? = nil, languages: LanguageService = CodeNavigation.languages) {
         self.object = object
         self.board = board
+        self.git = git
         let aim = Self.aim(object.props) ?? Aim(path: "", range: nil)
         displayed = aim
         propsAim = aim
@@ -80,12 +94,15 @@ final class CodeTile: NSView, TileContent {
         header.onPin = { [weak self] in self?.pin() }
         header.onCatchUp = { [weak self] in self?.catchUp() }
         header.onLocation = { [weak self] location in self?.userAim(location) }
-        NotificationCenter.default.addObserver(self, selector: #selector(baseChanged), name: .gitDiffBaseChanged, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(refsMoved(_:)), name: .gitRefsMoved, object: nil)
+        if git == nil {
+            NotificationCenter.default.addObserver(self, selector: #selector(baseChanged), name: .gitDiffBaseChanged, object: nil)
+            NotificationCenter.default.addObserver(self, selector: #selector(refsMoved(_:)), name: .gitRefsMoved, object: nil)
+        }
         header.show(caption: object.props["caption"]?.string)
         refreshHeader()
         resizeSubviews(withOldSize: .zero)
-        navigation = CodeNavigation(host: self, board: board, tile: object.id, accessories: header, reservedWidth: CodeHeaderBar.reservedTrailing)
+        navigation = CodeNavigation(host: self, board: board, tile: object.id, accessories: header, reservedWidth: CodeHeaderBar.reservedTrailing,
+                                    languages: languages)
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
@@ -94,12 +111,27 @@ final class CodeTile: NSView, TileContent {
     /// batch, zoomed out or offscreen) loads when it first becomes live instead.
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if git != nil, window == nil {
+            generation += 1
+            loadTask?.cancel()
+            anchorTask?.cancel()
+            loadTask = nil
+            hostWatch?.cancel()
+            hostWatch = nil
+            hostRetry?.cancel()
+            hostRetry = nil
+            reloadWork?.cancel()
+            reloadWork = nil
+            needsLoad = true
+        }
         if window != nil, isLive, needsLoad { load() }
     }
 
     deinit {
         loadTask?.cancel()
+        anchorTask?.cancel()
         vanishCheck?.cancel()
+        hostRetry?.cancel()
         if watcherSuspended { watcher?.resume() }
         watcher?.cancel()
         if let heldRepository { Task { await GitDiffEngine.shared.release(heldRepository) } }
@@ -195,6 +227,8 @@ final class CodeTile: NSView, TileContent {
         var pinned: String?
         var ref: String?
 
+        func sameText(as other: Source) -> Bool { pinned == other.pinned && ref == other.ref }
+
         /// Where the file is read from: `url` (the path on the board), or for a ref the file in the
         /// worktree that has it checked out, else in the board's checkout at the ref's commit.
         struct Located: Sendable {
@@ -236,6 +270,7 @@ final class CodeTile: NSView, TileContent {
     func update(_ object: CanvasObject) {
         let old = self.object
         self.object = object
+        if old.props != object.props { anchorTask?.cancel() }
         header.show(caption: object.props["caption"]?.string)
         let aim = Self.aim(object.props) ?? Aim(path: "", range: nil)
         if aim != propsAim {
@@ -247,7 +282,7 @@ final class CodeTile: NSView, TileContent {
             }
         }
         if old.props["diffBase"] != object.props["diffBase"] || old.props["pinnedCommit"] != object.props["pinnedCommit"] || old.props["ref"] != object.props["ref"] { load() }
-        if old.props["range"] != object.props["range"] || old.props["anchor"] != object.props["anchor"] {
+        if old.props != object.props {
             if documentIsCurrent {
                 reanchor()
             } else {
@@ -289,6 +324,7 @@ final class CodeTile: NSView, TileContent {
     /// The user scrolled, clicked, or selected in the tile: a ⌘-click preview becomes a tile
     /// they keep (`Board.keepCode`); a follow tile holds its re-aims.
     private func userInteracted() {
+        guard !hostBoardClosed else { return }
         board.keepCode(object.id)
         guard followOf != nil else { return }
         lock.interact(at: Self.now)
@@ -316,12 +352,14 @@ final class CodeTile: NSView, TileContent {
     }
 
     private func catchUp() {
+        guard !hostBoardClosed else { return }
         if let aim = lock.catchUp() { apply(aim) }
         refreshHeader()
     }
 
     /// The user picked a location (history strip): shown at once, as navigation (no undo step).
     private func userAim(_ aim: Aim) {
+        guard !hostBoardClosed else { return }
         lock.userAimed(aim)
         apply(aim)
         board.reaimForNavigation(object.id, to: CodeAim(path: aim.path, range: aim.range, pinnedCommit: pinnedCommit, ref: RefSource.ref(of: object.props)))
@@ -332,16 +370,18 @@ final class CodeTile: NSView, TileContent {
     /// Diff the file against its base, or read it at its pinned commit (git, off the main
     /// thread), build the model off the main thread, and install it. Deferred until the tile is live.
     private func load() {
-        guard isLive else {
+        anchorTask?.cancel()
+        generation += 1
+        guard !hostBoardClosed, isLive, git == nil || window != nil else {
             needsLoad = true
             return
         }
         needsLoad = false
+        if let git { return loadFromHost(git) }
         let path = displayed.path
         let url = board.absoluteURL(path)
         let source = source, boardRoot = board.root, refSha = object.props["refSha"]?.string
         if source.ref == nil { watch(url) }
-        generation += 1
         let current = generation
         loadTask?.cancel()
         loadTask = Task { [weak self] in
@@ -367,23 +407,108 @@ final class CodeTile: NSView, TileContent {
         }
     }
 
+    private func loadFromHost(_ git: HostGit) {
+        let path = displayed.path, source = source
+        let read = hostRead(path: path, source: source)
+        let current = generation
+        loadTask?.cancel()
+        hostRetry?.cancel()
+        hostRetry = nil
+        loadTask = Task { [weak self] in
+            let result: Result<HostCodeLoad, HostFileError>
+            do {
+                result = .success(try await git.code(read))
+            } catch let error as HostFileError {
+                result = .failure(error)
+            } catch {
+                return
+            }
+            await MainTurns.next()
+            guard let self, !Task.isCancelled, current == self.generation, self.isLive else { return }
+            self.loadTask = nil
+            switch result {
+            case .success(let load): self.installHost(load, source: source, git: git)
+            case .failure(let error): self.hostLoadFailed(error, path: path, source: source)
+            }
+        }
+    }
+
+    private func hostRead(path: String, source: Source) -> HostCodeRead {
+        HostCodeRead(boardRoot: board.root.path, path: path, base: source.base, pinned: source.pinned, ref: source.ref,
+                     refSha: source.ref.flatMap { hostRefShas[$0] } ?? object.props["refSha"]?.string)
+    }
+
+    private func learn(_ load: HostCodeLoad, source: Source) {
+        hostDefaultBranch = load.defaultBranch
+        if let ref = source.ref, let sha = load.refSha { hostRefShas[ref] = sha }
+        if hostFailure != nil {
+            hostFailure = nil
+            refreshHeader()
+        }
+    }
+
+    private func installHost(_ load: HostCodeLoad, source: Source, git: HostGit) {
+        learn(load, source: source)
+        install(load.document, source: source)
+        hostWatch?.cancel()
+        hostWatch = nil
+        guard let probe = load.probe else { return }
+        guard window != nil else {
+            needsLoad = true
+            return
+        }
+        hostWatch = HostFileWatch(baseline: load.baseline, probe: { await git.stamp(probe) }) { [weak self] _ in self?.scheduleReload() }
+    }
+
+    private func hostLoadFailed(_ error: HostFileError, path: String, source: Source) {
+        let message = if case .unavailable(let why) = error { why } else { "\(error)" }
+        if let document, document.path == path, document.diff.state != .unreadable {
+            hostFailure = .retained(message)
+            refreshHeader()
+        } else {
+            hostFailure = .unavailable
+            let diff = FileDiff(state: .unreadable, base: nil, baseLabel: "host unavailable: \(message)", old: SideText(""), new: SideText(""), hunks: [])
+            install(CodeDocument(path: path, diff: diff), source: source)
+        }
+        let current = generation
+        hostRetry = Task { [weak self] in
+            guard (try? await Task.sleep(for: .seconds(2))) != nil, let self, current == self.generation, self.isLive, self.window != nil else { return }
+            self.hostRetry = nil
+            self.load()
+        }
+    }
+
     /// Whether `document` is the file as it is now: a live tile watches its file and bases, and
     /// nothing is pending. Off screen or zoomed out nothing is watched, so a render or card
     /// reloads (a view.render of an offscreen tile must show the file on disk, never the last
     /// thing drawn).
     private var documentIsCurrent: Bool {
-        isLive && !needsLoad && loadTask == nil && reloadWork == nil && showsCurrent && loadedSource == source && document != nil
+        isLive && !needsLoad && loadTask == nil && reloadWork == nil && showsCurrent && loadedSource == source && document != nil && hostFailure == nil
     }
 
     /// The model without holding the repository, for renders and cards of tiles that aren't live.
     private func loadOffscreen() async -> CodeDocument? {
+        if hostBoardClosed { return document }
         if documentIsCurrent, let document { return document }
-        let path = displayed.path, source = source, boardRoot = board.root
-        let located = await source.locate(url: board.absoluteURL(path), path: path, boardRoot: boardRoot, refSha: object.props["refSha"]?.string)
-        if let resolved = located.ref { board.recordRefSha(object.id, ref: resolved.ref, sha: resolved.resolution.sha) }
-        let document = await source.document(path: path, located: located, boardRoot: boardRoot)
+        let path = displayed.path, source = source, current = generation
+        let document: CodeDocument
+        var hostLoad: HostCodeLoad?
+        if let git {
+            guard let load = try? await git.code(hostRead(path: path, source: source)) else { return nil }
+            hostLoad = load
+            document = load.document
+        } else {
+            let boardRoot = board.root
+            let located = await source.locate(url: board.absoluteURL(path), path: path, boardRoot: boardRoot, refSha: object.props["refSha"]?.string)
+            if let resolved = located.ref { board.recordRefSha(object.id, ref: resolved.ref, sha: resolved.resolution.sha) }
+            document = await source.document(path: path, located: located, boardRoot: boardRoot)
+        }
         await MainTurns.next()
-        guard path == displayed.path, source == self.source else { return nil }
+        guard !Task.isCancelled, !hostBoardClosed, current == generation, path == displayed.path, source == self.source else { return nil }
+        // A live host tile installs only from its own load. This read answers the card or render
+        // that asked, and must not replace the document, watch baseline, or ref cache.
+        if git != nil, isLive { return document }
+        if let hostLoad { learn(hostLoad, source: source) }
         if !showsCurrent || loadedSource != source || reanchorPending || self.document?.text != document.text || self.document?.signs != document.signs {
             install(document, source: source)
             // Not live: the next time it is, revalidate against the watched file and bases.
@@ -403,7 +528,7 @@ final class CodeTile: NSView, TileContent {
         self.document = document
         loadedSource = source
         reanchor()
-        rowsView.canEdit = document.side == .new && !document.isPinned
+        rowsView.canEdit = git == nil && document.side == .new && !document.isPinned
         // Laid-out lines are keyed by line number, which a new text reassigns.
         rowsView.cache.removeAll()
         // Another pinned commit is another text, not an edit.
@@ -438,7 +563,7 @@ final class CodeTile: NSView, TileContent {
     /// (`Board.codeFileVanished`; the user's own tiles stay). Checked again a moment later, so
     /// a save that deletes and re-creates the file isn't taken for a delete.
     private func fileVanished(_ path: String) {
-        guard vanishCheck == nil else { return }
+        guard git == nil, vanishCheck == nil else { return }
         let url = board.absoluteURL(path)
         let candidates = FollowFallback.candidates(object.props["history"]?.array ?? [], vanished: path).map { ($0, board.absoluteURL($0)) }
         vanishCheck = Task { [weak self] in
@@ -528,28 +653,29 @@ final class CodeTile: NSView, TileContent {
 
     /// The range as last found, its file, and the text it held then, which re-finds it after the
     /// file changes.
-    private var anchored: (path: String, range: LineRange, lines: [String])?
+    private var anchored: (path: String, source: Source, written: LineRange, range: LineRange, lines: [String])?
     /// Why the range's code can't be found: the header says so instead of tinting other lines.
     private var staleReason: String?
 
-    /// The range the rows tint: none while it is stale.
-    private var tintedRange: LineRange? { staleReason == nil ? displayed.range : nil }
+    /// Local relocation also applies to display-only files whose metadata cannot be persisted.
+    private var localRange: LineRange? {
+        guard let anchored, anchored.path == displayed.path, anchored.source.sameText(as: source),
+              anchored.written == displayed.range || anchored.range == displayed.range else { return displayed.range }
+        return anchored.range
+    }
+    private var tintedRange: LineRange? { staleReason == nil ? localRange : nil }
 
-    /// A tile showing a range keeps it on the code it showed, as note fences do (`CodeAnchor`,
-    /// `NoteAnchor`): with the file loaded or the range changed, the range is re-found by the
-    /// text it held (else `props.anchor`, its first line) and, moved or resized by lines
-    /// inserted or removed above or inside it, written back with its first line as bookkeeping
-    /// (`Board.reanchor`). Code that is gone leaves the range where it was, marked stale. Only
-    /// against the file as it is now: a range set while the tile's text may be behind the disk
-    /// (not live, or a reload pending) waits for the next load (`reanchorPending`), or it would
-    /// be anchored to whatever line that old text had there.
+    /// Display resolution uses the local document. Persistence re-reads through the board policy.
     private func reanchor() {
+        anchorTask?.cancel()
         reanchorPending = false
         let wasStale = staleReason
+        let wasRange = localRange
         defer {
-            if staleReason != wasStale {
+            if staleReason != wasStale || localRange != wasRange {
                 refreshPainter(keepSelection: true)
                 refreshHeader()
+                if localRange != wasRange { showRange() }
             }
         }
         guard let document, showsCurrent, document.side == .new, document.text.lineCount > 0,
@@ -558,18 +684,21 @@ final class CodeTile: NSView, TileContent {
             return
         }
         let source = NoteSource.lines(of: document.text.text)
-        let captured = anchored.flatMap { $0.path == displayed.path && $0.range == written ? $0.lines : nil }
+        let captured = anchored.flatMap {
+            $0.path == displayed.path && $0.source.sameText(as: self.source) && ($0.written == written || $0.range == written) ? $0.lines : nil
+        }
+        if git == nil, !board.isRemote {
+            anchorTask = Task { [board, id = object.id] in
+                _ = try? await board.reanchor(id, captured: captured)
+            }
+        }
         let resolution = NoteAnchor.resolve(fence, in: source, captured: captured)
         guard let range = resolution.range else {
             if case .stale(let reason) = resolution.status { staleReason = reason }
             return
         }
         staleReason = nil
-        anchored = (displayed.path, range, Array(source[(range.start - 1)..<range.end]))
-        let anchor = CodeAnchor.anchor(of: range, in: source)
-        if range != written || anchor != fence.anchor {
-            try? board.reanchor(object.id, range: range, anchor: anchor)
-        }
+        anchored = (displayed.path, self.source, written, range, Array(source[(range.start - 1)..<range.end]))
     }
 
     /// `object.get`'s `rangeStatus`: the range resolved against the file as it is now (loaded
@@ -577,13 +706,19 @@ final class CodeTile: NSView, TileContent {
     /// there, so a first line repeated elsewhere doesn't pass for the code it showed. Nil for a
     /// tile whose range doesn't anchor.
     func rangeStatus() async -> NoteExcerpt? {
-        guard CodeAnchor.fence(object.props) != nil, let document = await loadOffscreen(),
+        guard CodeAnchor.fence(object.props) != nil, let document = await loadOffscreen() else { return nil }
+        let current = generation, aim = displayed, reading = source
+        await anchorTask?.value
+        guard current == generation, aim == displayed, reading == source,
+              document.path == displayed.path,
               let fence = CodeAnchor.fence(object.props), let path = fence.path, let written = fence.lines else { return nil }
         guard document.side == .new, document.diff.state != .missing else {
             return NoteExcerpt(path: path, range: nil, lines: [], status: .stale("no file \(path)"), missing: true)
         }
         let source = NoteSource.lines(of: document.text.text)
-        let captured = anchored.flatMap { $0.path == path && $0.range == written ? $0.lines : nil }
+        let captured = anchored.flatMap {
+            $0.path == path && $0.source.sameText(as: self.source) && ($0.written == written || $0.range == written) ? $0.lines : nil
+        }
         let resolution = NoteAnchor.resolve(fence, in: source, captured: captured)
         let lines = resolution.range.map { Array(source[($0.start - 1)..<$0.end]) } ?? []
         return NoteExcerpt(path: path, range: resolution.range, lines: lines, status: resolution.status, fileLineCount: source.count)
@@ -690,7 +825,7 @@ extension CodeTile {
     /// Bring the range into view (a few rows below the top), or the top of a new file.
     private func showRange() {
         guard showsCurrent, let rows = rowsView.painter?.rows else { return }
-        guard let range = displayed.range else { return scroll(toRow: 0) }
+        guard let range = localRange else { return scroll(toRow: 0) }
         let first = rows.index(ofLine: range.start)
         scroll(toRow: first, count: rows.rows(ofLine: range.end).upperBound - first)
     }
@@ -747,8 +882,12 @@ extension CodeTile {
     }
 
     private func showHeader(for document: CodeDocument?) {
+        var warnings = [staleReason.map { "stale: \($0)" }, document?.warning].compactMap { $0 }
+        if git != nil, document != nil {
+            if case .retained(let message) = hostFailure { warnings.append("host unavailable: \(message)") }
+        }
+        let warning = warnings.joined(separator: " · ")
         // A pinned tile, or one reading its ref's objects, has no diff base to pick.
-        let warning = [staleReason.map { "stale: \($0)" }, document?.warning].compactMap { $0 }.joined(separator: " · ")
         let readOnly = pinnedCommit != nil || (source.ref != nil && document.map { $0.isPinned || $0.diff.state == .pinUnavailable } ?? true)
         header.show(diffBase: readOnly ? nil : diffBaseProp, defaultBranch: defaultBranch(for: document), baseDescription: document?.baseDescription,
                     status: document?.status ?? "loading…", warning: warning.isEmpty ? nil : warning, changes: !(document?.signs.isEmpty ?? true), follow: followOf != nil, missed: lock.missed)
@@ -761,6 +900,10 @@ extension CodeTile {
     /// The default branch the base picker names (`Branch vs origin/main`): the one the
     /// merge-base was taken with, else as the repository's files say (read once per repository).
     private func defaultBranch(for document: CodeDocument?) -> String? {
+        if git != nil {
+            guard let diff = document?.diff else { return nil }
+            return diff.baseLabel.flatMap(GitDiffEngine.ResolvedBase.mergeBaseBranch) ?? hostDefaultBranch
+        }
         guard let diff = document?.diff, let repository = diff.repository else { return nil }
         if let branch = diff.baseLabel.flatMap(GitDiffEngine.ResolvedBase.mergeBaseBranch) { return branch }
         if let known = knownDefaultBranch, known.repository == repository { return known.branch }
@@ -779,7 +922,7 @@ extension CodeTile {
     // MARK: Actions
 
     private func setBase(_ base: String) {
-        guard base != diffBaseProp else { return }
+        guard !hostBoardClosed, base != diffBaseProp else { return }
         _ = try? board.update(object.id, props: .object(["diffBase": .string(base)]))
     }
 
@@ -807,15 +950,16 @@ extension CodeTile {
 
     /// Keep what the follow tile shows as a permanent code tile beside it.
     private func pin() {
+        guard !hostBoardClosed else { return }
         _ = try? board.pin(object.id, path: displayed.path, range: displayed.range)
     }
 
     /// Open the user's editor (`$VISUAL`/`$EDITOR` from the login shell, else nvim or vi) at the
     /// clicked line in a terminal tile beside this one, in view (`CanvasView.openForUser`).
     private func editHere(at point: NSPoint) {
-        guard let document, showsCurrent, document.side == .new, !document.isPinned else { return }
+        guard git == nil, let document, showsCurrent, document.side == .new, !document.isPinned else { return }
         board.keepCode(object.id)
-        let line = displayedLine(atY: point.y) ?? displayed.range?.start ?? 1
+        let line = displayedLine(atY: point.y) ?? localRange?.start ?? 1
         let path = document.readPath
         Task { [weak self] in
             // The login shell is a blocking subprocess (once, then cached).
@@ -875,6 +1019,7 @@ extension CodeTile {
     }
 
     private func scheduleReload() {
+        anchorTask?.cancel()
         reloadWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
@@ -890,9 +1035,33 @@ extension CodeTile {
 // MARK: TileContent
 
 extension CodeTile {
+    func setHostBoardClosed(_ closed: Bool) {
+        guard hostBoardClosed != closed else { return }
+        let live = isLive
+        if closed {
+            navigation?.setActive(false)
+            resumeWork?.cancel()
+            resumeWork = nil
+        }
+        setLive(false)
+        hostBoardClosed = closed
+        setLive(live)
+        if !closed { scheduleResume() }
+    }
+
     func setLive(_ live: Bool) {
         guard live != isLive else { return }
         isLive = live
+        if hostBoardClosed {
+            if live {
+                addSubview(rowsView)
+                addSubview(header)
+            } else {
+                rowsView.removeFromSuperview()
+                header.removeFromSuperview()
+            }
+            return
+        }
         if live {
             if watcherSuspended { watcher?.resume() }
             watcherSuspended = false
@@ -908,10 +1077,16 @@ extension CodeTile {
             reloadWork?.cancel()
             reloadWork = nil
             loadTask?.cancel()
+            anchorTask?.cancel()
             loadTask = nil
             stopFlash()
             vanishCheck?.cancel()
             vanishCheck = nil
+            if hostWatch != nil || hostRetry != nil { needsLoad = true }
+            hostWatch?.cancel()
+            hostWatch = nil
+            hostRetry?.cancel()
+            hostRetry = nil
             // Nothing with tracking areas, tooltips, or a backing store stays in the window: the
             // card covers the tile, and pans would otherwise update them every frame.
             navigation?.setActive(false)
@@ -951,7 +1126,7 @@ extension CodeTile {
     func keyboardMention(hasKeyboard: Bool) async -> MentionTarget? {
         guard let document, showsCurrent, let painter = rowsView.painter else { return nil }
         if let selected = rowsView.selectedEntries { return target(entries: selected, painter: painter, document: document) }
-        guard hasKeyboard, let range = displayed.range, let lines = document.lines(for: range) else { return nil }
+        guard hasKeyboard, let range = localRange, let lines = document.lines(for: range) else { return nil }
         return code(LineRange(start: lines.lowerBound, end: lines.upperBound), side: document.side, in: document)
     }
 
@@ -1049,7 +1224,7 @@ extension CodeTile {
     /// when there is nothing to act on (a deleted file, nothing loaded yet).
     @discardableResult
     func navigate(_ action: KeyboardNavigation) -> Bool {
-        guard let navigation, let document, showsCurrent, let painter = rowsView.painter else { return false }
+        guard !hostBoardClosed, let navigation, let document, showsCurrent, let painter = rowsView.painter else { return false }
         let topRow = rowsView.topRow
         if action == .outline {
             navigation.showOutline(anchor: NSPoint(x: painter.gutterWidth + 8, y: CodePainter.rowTop(topRow)))
@@ -1063,8 +1238,8 @@ extension CodeTile {
             let shown = painter.visibleRows(rowsView.bounds).compactMap { row -> Int? in
                 if case .line(let line)? = painter.rows.row(row) { line } else { nil }
             }
-            if let anchor = displayed.range?.start ?? shown.min(),
-               let found = CodeSubject.first(from: anchor, through: max(displayed.range?.end ?? anchor, shown.max() ?? anchor), line: { document.text(of: .line($0)) }) {
+            if let anchor = localRange?.start ?? shown.min(),
+               let found = CodeSubject.first(from: anchor, through: max(localRange?.end ?? anchor, shown.max() ?? anchor), line: { document.text(of: .line($0)) }) {
                 subject = (found.line, found.character)
             }
         }
@@ -1085,7 +1260,7 @@ extension CodeTile {
     }
 
     /// Whether `navigate` has anything to act on (menu validation).
-    var canNavigate: Bool { document != nil && showsCurrent && rowsView.painter != nil }
+    var canNavigate: Bool { !hostBoardClosed && document != nil && showsCurrent && rowsView.painter != nil }
 
     // MARK: Offscreen drawing
 
@@ -1109,9 +1284,9 @@ extension CodeTile {
         header.prepareForSnapshot()
         let headerHeight = header.height
         let headerImage = TileRenderRequest(size: header.bounds.size, scale: scale, full: false, appearance: appearance).image(of: header)
-        let content = document.content(range: displayed.range, rows: rows, width: size.width, headerHeight: headerHeight)
+        let content = document.content(range: localRange, rows: rows, width: size.width, headerHeight: headerHeight)
         var fullScroll: CGFloat = 0
-        if let lines = displayed.range.flatMap(document.lines(for:)) {
+        if let lines = localRange.flatMap(document.lines(for:)) {
             let first = rows.index(ofLine: lines.lowerBound)
             let count = rows.rows(ofLine: lines.upperBound).upperBound - first
             fullScroll = CodeMetrics.scrollOffset(toRow: first, count: count, viewport: max(size.height, content.height) - headerHeight, totalRows: rows.count)
@@ -1162,18 +1337,16 @@ extension CodeTile {
     /// Cards requested together (a pinch out over a dozen live tiles) render one per wake:
     /// drawn back to back in the liveness pass, ~5 ms each held the first frame after the pinch
     /// for ~45 ms. The live view stays up until its card arrives.
-    func cardSnapshot(_ deliver: @escaping @MainActor (NSImage?) -> Void) {
+    func cardSnapshot() async -> NSImage? {
         let appearance = effectiveAppearance
         let size = bounds.size
-        Task { [weak self] in
-            await MainTurns.next()
-            guard let self else { return deliver(nil) }
-            if self.documentIsCurrent, let document = self.document {
-                return deliver(self.image(of: document, size: size, scale: TileFrameView.cardPixelsPerPoint, full: false, appearance: appearance).image)
-            }
-            guard let document = await self.loadOffscreen() else { return deliver(nil) }
-            deliver(self.image(of: document, size: size, scale: TileFrameView.cardPixelsPerPoint, full: false, appearance: appearance).image)
+        await MainTurns.next()
+        guard !Task.isCancelled else { return nil }
+        if documentIsCurrent, let document {
+            return image(of: document, size: size, scale: TileFrameView.cardPixelsPerPoint, full: false, appearance: appearance).image
         }
+        guard let document = await loadOffscreen(), !Task.isCancelled else { return nil }
+        return image(of: document, size: size, scale: TileFrameView.cardPixelsPerPoint, full: false, appearance: appearance).image
     }
 }
 
@@ -1181,6 +1354,18 @@ extension CodeTile {
 
 extension CodeTile: CodeNavigationHost {
     var navigationPath: String { showsCurrent ? document?.readPath ?? displayed.path : displayed.path }
+    var navigationText: SideText? { showsCurrent ? document?.text : nil }
+    var navigationEnabled: Bool { !hostBoardClosed }
+
+    var navigationUnavailableReason: String? {
+        guard git != nil else { return nil }
+        guard showsCurrent, let document else { return "Host code is not loaded for navigation." }
+        if pinnedCommit != nil || document.isPinned || document.diff.state == .pinUnavailable {
+            return "Language actions are unavailable for historical host code. Open a live checkout file."
+        }
+        if case .retained = hostFailure { return "Host code is unavailable for navigation while the host is offline." }
+        return nil
+    }
 
     var navigationView: NSView { rowsView }
 

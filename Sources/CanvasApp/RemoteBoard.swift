@@ -1,17 +1,31 @@
 import AppKit
 import CanvasCore
 
-/// A remote board's window (docs/design.md "Client mode"): the host it mirrors, and how its tiles
-/// reach that host. Terminals attach to the host's zmx sessions over ssh; tiles drawn from the
-/// host's files or pages show the host's rendering (`RemoteImageTile`).
 @MainActor
 final class RemoteSource {
     let host: RemoteHost
     let mirror: BoardMirror
+    let files: HostFiles
+    let git: HostGit
+    let languages: LanguageService
+    private static var languagePool: [(route: HostRoute, service: LanguageService)] = []
+
+    static var languageServices: [LanguageService] { languagePool.map(\.service) }
 
     init(host: RemoteHost, mirror: BoardMirror) {
         self.host = host
         self.mirror = mirror
+        let master = HostMaster.named(host.sshTarget, support: AppPaths.support.path)
+        let files = HostFiles(host: host, master: master)
+        self.files = files
+        git = HostGit(files: files)
+        if let pooled = Self.languagePool.first(where: { $0.route == master.route }) {
+            languages = pooled.service
+        } else {
+            let service = LanguageService(host: files)
+            Self.languagePool.append((master.route, service))
+            languages = service
+        }
     }
 
     /// The window's title: the board's name (its root folder, as a local board's window says it) at the host.
@@ -19,9 +33,73 @@ final class RemoteSource {
         "\(board.root.lastPathComponent) @ \(host.name)"
     }
 
-    /// What a terminal tile runs to show the host's session for `tile`.
-    func attachCommand(for tile: ObjectID) -> [String] {
-        host.terminalAttachCommand(session: TerminalTile.sessionName(tile))
+    /// Attaches where the terminal runs, checking the board host's ownership labels.
+    func attachCommand(for terminal: CanvasObject) -> [String] {
+        host.terminalAttachCommand(for: terminal, board: mirror.sessionBoardID, merged: mirror.mergedBoards)
+    }
+
+    func drawsPage(_ browser: CanvasObject) -> Bool {
+        guard host.server == .easld, let id = ClientIdentity.thisMac.id else { return false }
+        return DrawingMachine(browser.props)?.id == id
+    }
+}
+
+extension ClientIdentity {
+    static let thisMac: ClientIdentity = {
+        let app = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String, host = TerminalHost.localHostname()
+        do {
+            return ClientIdentity(app: app, host: host, id: try MachineIdentity.load(from: AppPaths.clientID))
+        } catch {
+            NSLog("easl: no machine identity (%@): this Mac runs no remote board's browser page", String(describing: error))
+            return ClientIdentity(app: app, host: host, id: nil)
+        }
+    }()
+
+    var drawingMachine: DrawingMachine? { id.map { DrawingMachine(id: $0, host: host) } }
+}
+
+extension ViewerWindow {
+    /// `controller`'s window as its board's easld asks it (`CanvasWindowController.serveHost`).
+    init(_ controller: CanvasWindowController) {
+        let terminal = { [weak controller] (id: ObjectID) -> TerminalTile? in controller?.canvas.tiles[id]?.content as? TerminalTile }
+        self.init(
+            focused: { [weak controller] in controller?.window?.isKeyWindow == true },
+            viewState: { [weak controller] in controller?.canvas.viewState },
+            render: { [weak controller] request, format in
+                guard let canvas = controller?.canvas else { throw ApiRouter.Failure("unavailable", "this board's window closed") }
+                return try await canvas.render(request, format: format, hostPictures: false)
+            },
+            hostPicture: { [weak controller] id in controller?.canvas.showsHostPicture(id) ?? false },
+            measureHTML: { [weak controller] props, width in
+                guard let controller, let files = controller.remote?.files else { throw ApiRouter.Failure("unavailable", "this board's window closed") }
+                return try await HtmlTile.measure(props: props, width: width, remote: controller.board, files: files)
+            },
+            reload: { [weak controller] id, caller, timeoutMs in
+                guard let content = controller?.canvas.tiles[id]?.content else { throw ApiRouter.Failure("unavailable", "browser tile \(id) isn't shown by this viewer") }
+                guard let browser = content as? BrowserTile else {
+                    throw ApiRouter.Failure("unavailable", "browser tile \(id) draws on another Mac, not this viewer")
+                }
+                do {
+                    return try await browser.reloadPage(driver: caller, timeoutMs: timeoutMs)
+                } catch let error as CmuxError {
+                    throw ApiRouter.Failure(error.code, error.message)
+                }
+            },
+            browse: { [weak controller] id, command, caller in
+                guard let browser = controller?.canvas.tiles[id]?.content as? BrowserTile else {
+                    throw ApiRouter.Failure("unavailable", "browser tile \(id) draws on another Mac, not this viewer")
+                }
+                return try await browser.perform(command, driver: caller)
+            },
+            submit: { id, text in await terminal(id)?.submit(text) ?? false },
+            surfaceTail: { id, lines in terminal(id)?.surfaceTail(lines: lines) },
+            block: { id, index in
+                guard let tile = terminal(id) else { throw ApiRouter.Failure("unavailable", "terminal \(id) isn't shown in a window") }
+                return try tile.block(index)
+            },
+            // Gemini CLI pads its title to a fixed width. The terminal's program and pid are its host's.
+            status: { id in terminal(id).map { TerminalStatus(title: $0.oscTitle?.trimmingCharacters(in: .whitespaces), lastCommand: $0.lastCommand, focused: $0.isWatched) } },
+            languages: { [weak controller] in controller?.remote?.languages })
     }
 }
 
@@ -70,18 +148,22 @@ final class ConnectionBanner: NSVisualEffectView {
 
     @objc private func retryPressed() { onRetry?() }
 
-    /// Shows the banner for `state` (hidden while online). `problem` is why the link is down.
-    func show(_ state: EaslConnection.State, host: String, problem: String?) {
-        switch state {
-        case .online:
-            isHidden = true
-            return
-        case .connecting:
-            label.stringValue = "Reconnecting to \(host)…"
+    func show(_ state: EaslConnection.State, availability: BoardMirror.Availability, host: String, problem: String?) {
+        if availability == .closed {
+            label.stringValue = "\(host) closed this board: the board as last seen"
             retry.isHidden = true
-        case .offline:
-            label.stringValue = "\(host) is offline: the board as last seen" + (problem.map { " (\($0))" } ?? "")
-            retry.isHidden = false
+        } else {
+            switch state {
+            case .online:
+                isHidden = true
+                return
+            case .connecting:
+                label.stringValue = "Reconnecting to \(host)…"
+                retry.isHidden = true
+            case .offline:
+                label.stringValue = "\(host) is offline: the board as last seen" + (problem.map { " (\($0))" } ?? "")
+                retry.isHidden = false
+            }
         }
         let wasHidden = isHidden
         isHidden = false
@@ -89,5 +171,31 @@ final class ConnectionBanner: NSVisualEffectView {
             NSAccessibility.post(element: self, notification: .announcementRequested,
                                  userInfo: [.announcement: label.stringValue, .priority: NSAccessibilityPriorityLevel.high.rawValue])
         }
+    }
+}
+
+@MainActor
+final class ClosedBoardView: NSView {
+    private let canvas: CanvasView
+
+    init(canvas: CanvasView, frame: NSRect) {
+        self.canvas = canvas
+        super.init(frame: frame)
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        guard canvas.bounds.contains(canvas.convert(local, from: self)),
+              let parent = canvas.superview,
+              let hit = canvas.hitTest(parent.convert(local, from: self)) else { return self }
+        if hit is CodeRowsView || hit is QuestionPage || hit is NSScroller { return hit }
+        if let text = sequence(first: hit, next: \.superview).first(where: { $0 is NSTextView }) as? NSTextView,
+           text.isSelectable, !text.isEditable { return hit }
+        return canvas
     }
 }

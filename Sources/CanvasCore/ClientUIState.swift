@@ -95,12 +95,53 @@ public enum ChromeTextScale {
         let next = bigger ? index + 1 : index - 1
         return levels.indices.contains(next) ? levels[next] : nil
     }
+}
 
-    private struct State: Codable {
-        var scale: Double
+/// The app's own settings in an easl home (`ui-settings.json`). Each change reads the file again
+/// and writes back only its own field, so one setting's write keeps the others'.
+public struct UISettings: Equatable, Sendable {
+    /// `ChromeTextScale`'s level.
+    public var chromeTextScale: Double
+    /// Remote easld boards in the reopen list (`RemoteReopen`) stay attached while easl runs, also
+    /// with their windows closed (docs/design.md "Client mode"). On unless turned off.
+    public var backgroundAttach: Bool
+    public var installUpdatesAutomatically: Bool
+    /// Seconds a closed question that was created naming no `archiveAfter` stays in view on the
+    /// boards this Mac hosts (`BoardRegistry.defaultQuestionArchiveAfter`), read at launch.
+    public var questionArchiveAfter: TimeInterval
+
+    public init(chromeTextScale: Double = ChromeTextScale.normal, backgroundAttach: Bool = true,
+                questionArchiveAfter: TimeInterval = QuestionSpec.defaultArchiveAfter,
+                installUpdatesAutomatically: Bool = false) {
+        self.chromeTextScale = chromeTextScale
+        self.backgroundAttach = backgroundAttach
+        self.questionArchiveAfter = questionArchiveAfter
+        self.installUpdatesAutomatically = installUpdatesAutomatically
     }
 
-    /// The setting's file in an easl home (`ui-settings.json`).
+    /// On disk: a missing or damaged field is that setting's default, whatever the others hold.
+    private struct File: Codable {
+        var scale: Double?
+        var backgroundAttach: Bool?
+        var questionArchiveAfter: Double?
+        var installUpdatesAutomatically: Bool?
+
+        init(_ settings: UISettings) {
+            scale = settings.chromeTextScale
+            backgroundAttach = settings.backgroundAttach
+            questionArchiveAfter = settings.questionArchiveAfter
+            installUpdatesAutomatically = settings.installUpdatesAutomatically
+        }
+
+        init(from decoder: Decoder) throws {
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            scale = try? fields.decodeIfPresent(Double.self, forKey: .scale)
+            backgroundAttach = try? fields.decodeIfPresent(Bool.self, forKey: .backgroundAttach)
+            questionArchiveAfter = try? fields.decodeIfPresent(Double.self, forKey: .questionArchiveAfter)
+            installUpdatesAutomatically = try? fields.decodeIfPresent(Bool.self, forKey: .installUpdatesAutomatically)
+        }
+    }
+
     public struct Store: Sendable {
         public let url: URL
 
@@ -108,15 +149,167 @@ public enum ChromeTextScale {
             self.url = url
         }
 
-        /// The saved level; 100% when there is none or the file is unreadable.
-        public func load() -> Double {
-            guard let data = try? Data(contentsOf: url), let state = try? JSONDecoder().decode(State.self, from: data) else { return normal }
-            return level(nearest: state.scale)
+        /// Missing or unreadable settings use their defaults, including automatic updates off.
+        public func load() -> UISettings { (try? read()) ?? UISettings() }
+
+        private func read() throws -> UISettings {
+            do {
+                let file = try JSONDecoder().decode(File.self, from: Data(contentsOf: url))
+                return UISettings(chromeTextScale: file.scale.map(ChromeTextScale.level(nearest:)) ?? ChromeTextScale.normal,
+                                  backgroundAttach: file.backgroundAttach ?? true,
+                                  questionArchiveAfter: file.questionArchiveAfter.flatMap { QuestionSpec.archiveDelay(.number($0)) } ?? QuestionSpec.defaultArchiveAfter,
+                                  installUpdatesAutomatically: file.installUpdatesAutomatically ?? false)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                return UISettings()
+            }
         }
 
-        public func save(_ scale: Double) throws {
+        /// Writes the settings as the file holds them now, with `change` applied.
+        public func update(_ change: (inout UISettings) -> Void) throws {
+            var settings = try read()
+            change(&settings)
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONEncoder().encode(State(scale: scale)).write(to: url, options: .atomic)
+            try JSONEncoder().encode(File(settings)).write(to: url, options: .atomic)
+        }
+    }
+}
+
+/// A remote easld board in the reopen list (`remote-boards.json`): one this Mac opened whose tab
+/// wasn't closed by hand or with `board.close`. Background attach attaches these again at launch.
+/// Only how to reach the board: its host, the easld there by its home, and the board. The host is
+/// discovered afresh each time, and nothing the board holds (root, view, composer, drawings,
+/// pages) is kept on this Mac.
+public struct RemoteReopen: Codable, Hashable, Sendable {
+    /// The host as the user knows it (`RemoteHost.name`).
+    public var host: String
+    public var sshTarget: String
+    /// The easld's home on the host (`RemoteHost.home`): one host may run several, and two of them
+    /// may have a board with one id. Nil only in an entry saved before easl recorded it.
+    public var home: String?
+    public var board: BoardID
+
+    public init(host: String, sshTarget: String, home: String?, board: BoardID) {
+        self.host = host
+        self.sshTarget = sshTarget
+        self.home = home
+        self.board = board
+    }
+
+    /// `board` on the easld `host` is; nil when `host`'s socket names no home.
+    public init?(board: BoardID, on host: RemoteHost) {
+        guard let home = host.home else { return nil }
+        self.init(host: host.name, sshTarget: host.sshTarget, home: home, board: board)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case host, sshTarget, home, board
+    }
+
+    /// A `home` that is there is a string: a null or another value is damage, never an entry saved
+    /// before easl recorded homes, which would reach the host's default easld.
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        host = try fields.decode(String.self, forKey: .host)
+        sshTarget = try fields.decode(String.self, forKey: .sshTarget)
+        home = try fields.contains(.home) ? fields.decode(String.self, forKey: .home) : nil
+        board = try fields.decode(BoardID.self, forKey: .board)
+    }
+
+    /// Where background attach looks for the board's easld (`RemoteHost.discover`'s `support`, nil
+    /// for the host's default): the saved home, whatever `devRemoteHome` (`EASL_DEV_REMOTE_HOME`)
+    /// is now. An entry saved before easl recorded homes goes to `devRemoteHome` when there is one,
+    /// so a development instance never reaches the host's default easld through it.
+    public func support(devRemoteHome: String?) -> String? { home ?? devRemoteHome }
+
+    /// The reopen list, in the order its boards were opened.
+    public struct Store: Sendable {
+        public let url: URL
+
+        public init(url: URL) {
+            self.url = url
+        }
+
+        /// An unreadable file is an empty list. A hand-edited entry ssh would misread, that names
+        /// no board, or whose home is no absolute path, is left out (`RemoteHost.problem(withHost:)`).
+        public func load() -> [RemoteReopen] { (try? read()) ?? [] }
+
+        private func read() throws -> [RemoteReopen] {
+            do {
+                let entries = try JSONDecoder().decode([RemoteReopen].self, from: Data(contentsOf: url))
+                return entries.filter {
+                    RemoteHost.problem(withHost: $0.sshTarget) == nil && ApiRouter.isBoardID($0.board) && ($0.home.map(RemoteHost.isHome) ?? true)
+                }
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                return []
+            }
+        }
+
+        public func support(sshTarget: String, board: BoardID, devRemoteHome: String?, recentHome: String?) throws -> String? {
+            let entries = try read().filter { $0.sshTarget == sshTarget && $0.board == board }
+            if entries.count > 1 {
+                if let devRemoteHome, let selected = entries.first(where: { $0.home == devRemoteHome }) { return selected.home }
+                throw ApiRouter.Failure("ambiguous", "\(board) has saved addresses on several easld homes at \(sshTarget)")
+            }
+            if let entry = entries.first { return entry.support(devRemoteHome: devRemoteHome) }
+            return devRemoteHome ?? recentHome
+        }
+
+        /// `entry` is in the list: added at the end, or in place of the one for its board on its
+        /// easld, else of one saved before easl recorded homes for its board on its host.
+        public func remember(_ entry: RemoteReopen) throws {
+            var entries = try read()
+            func place(home: String?) -> Int? {
+                entries.firstIndex { $0.sshTarget == entry.sshTarget && $0.board == entry.board && $0.home == home }
+            }
+            if let index = place(home: entry.home) ?? place(home: nil) {
+                guard entries[index] != entry else { return }
+                entries[index] = entry
+            } else {
+                entries.append(entry)
+            }
+            try save(entries)
+        }
+
+        /// No entry for `entry`'s board on its easld is left, nor one saved before easl recorded
+        /// homes for that board on its host, which may have been that easld's.
+        public func forget(_ entry: RemoteReopen) throws {
+            let entries = try read()
+            let kept = entries.filter {
+                !($0.sshTarget == entry.sshTarget && $0.board == entry.board && ($0.home == entry.home || $0.home == nil))
+            }
+            guard kept.count != entries.count else { return }
+            try save(kept)
+        }
+
+        private func save(_ entries: [RemoteReopen]) throws {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(entries).write(to: url, options: .atomic)
+        }
+    }
+}
+
+/// How a remote board's window was closed by hand, taken when the close is asked for: AppKit takes
+/// a closing tab out of its group before the window says it closed.
+public enum RemoteClose: Equatable, Sendable {
+    /// A tab beside others: the user is done with the board, as with `board.close`.
+    case tab
+    /// The window's only tab.
+    case window
+
+    public enum Outcome: Equatable, Sendable {
+        /// Out of the reopen list and detached.
+        case forget
+        /// Still in the reopen list, detached until background attach brings it back.
+        case detach
+        /// Still in the reopen list and attached, its window closed.
+        case retain
+    }
+
+    /// Only an easld host takes a viewer as its client: an app server answers its own calls.
+    public func outcome(backgroundAttach: Bool, server: RemoteHost.Server?) -> Outcome {
+        switch self {
+        case .tab: .forget
+        case .window: backgroundAttach && server == .easld ? .retain : .detach
         }
     }
 }

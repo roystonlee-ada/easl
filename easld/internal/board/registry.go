@@ -3,8 +3,10 @@ package board
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"github.com/twaldin/easl/easld/internal/measure"
 	"github.com/twaldin/easl/easld/internal/metrics"
 	"github.com/twaldin/easl/easld/internal/model"
+	"github.com/twaldin/easl/easld/internal/question"
 	"github.com/twaldin/easl/easld/internal/store"
 )
 
@@ -31,9 +34,10 @@ type subscriber struct {
 // Registry is every open board plus event fan-out to subscribers (BoardRegistry in
 // ApiRouter.swift). Mu serialises all board work: hold it while calling into any board.
 type Registry struct {
-	Mu     sync.Mutex
-	Store  *store.Store
-	boards map[string]*Board
+	Mu                     sync.Mutex
+	Store                  *store.Store
+	boards                 map[string]*Board
+	closedComposerReceipts map[string][]map[string]any
 	// Frontmost is the default board for a call that names none.
 	Frontmost   string
 	subscribers []subscriber
@@ -51,12 +55,16 @@ type Registry struct {
 	// Texts measures text the app lays out (arrow captions, for routing) on every board opened
 	// from now on. Nil: arrows route without their labels.
 	Texts measure.Texts
-	pid   int
+	// DefaultQuestionArchiveAfter is the host delay for a new question that names none,
+	// copied onto each board as it opens. Not saved. Zero is a real delay, so this starts
+	// at the historical 10 rather than the zero value.
+	DefaultQuestionArchiveAfter float64
+	pid                         int
 }
 
 // NewRegistry opens a registry over the boards stored in dir, saving debounce after changes.
 func NewRegistry(dir string, debounce time.Duration, agentReports string) *Registry {
-	r := &Registry{boards: map[string]*Board{}, AgentReports: agentReports, pid: os.Getpid()}
+	r := &Registry{boards: map[string]*Board{}, AgentReports: agentReports, DefaultQuestionArchiveAfter: question.DefaultArchiveAfter, pid: os.Getpid()}
 	r.Store = store.New(dir, debounce, &r.Mu)
 	return r
 }
@@ -98,15 +106,18 @@ func (r *Registry) Open(root string) (*Board, error) {
 	if err != nil {
 		return nil, err
 	}
+	b.composerReceipts = r.closedComposerReceipts[id]
+	delete(r.closedComposerReceipts, id)
 	if worktree != nil {
 		b.OpenedFrom(*worktree)
 	}
 	b.Texts = r.Texts
+	b.defaultQuestionArchiveAfter = r.DefaultQuestionArchiveAfter
 	b.OnEvent = func(e model.Event) {
 		if r.Hook != nil {
 			r.Hook(b, e)
 		}
-		r.broadcast(e, b.id)
+		r.broadcast(e.Name, e.Data, b.id)
 	}
 	b.OnMessagesBounced = func(bounce Bounce) {
 		if r.Bounced != nil {
@@ -124,11 +135,13 @@ func (r *Registry) Open(root string) (*Board, error) {
 		r.Frontmost = id
 	}
 	r.replayAgentReports(b)
-	// Questions that expired while the board was closed expire now.
+	// Questions that expired while the board was closed expire now. Closed ones already past
+	// their archive delay were archived while loading, with no revision change.
 	b.ScheduleQuestionExpiry()
 	if r.Opened != nil {
 		r.Opened(b, root)
 	}
+	r.broadcast("board.opened", map[string]any{}, b.id)
 	return b, nil
 }
 
@@ -144,6 +157,15 @@ func (r *Registry) load(root, id, commonDir string) (*Board, error) {
 	var b *Board
 	if snap != nil {
 		snap.Root = root
+		changed := scrubSnapshotAnchors(snap)
+		if scrubDueQuestions(snap, time.Now()) {
+			changed = true
+		}
+		if changed {
+			if err := r.Store.Write(snap); err != nil {
+				return nil, fmt.Errorf("save normalized board %s: %w", id, err)
+			}
+		}
 		b = FromSnapshot(snap)
 	} else {
 		b = New(id, root)
@@ -156,7 +178,16 @@ func (r *Registry) load(root, id, commonDir string) (*Board, error) {
 		}
 		b.Repo = rec
 	}
-	b.OnChange = func() { r.Store.ScheduleSave(b.id, b.Snapshot) }
+	b.OnChange = func() {
+		if !b.closed {
+			r.Store.ScheduleSave(b.id, func() *store.Snapshot {
+				if r.boards[b.id] != b {
+					return nil
+				}
+				return b.Snapshot()
+			})
+		}
+	}
 	b.Lock = &r.Mu
 	return b, nil
 }
@@ -184,20 +215,46 @@ func (r *Registry) Containing(id string) (*Board, bool) {
 	return nil, false
 }
 
-// Close saves and closes a board.
-func (r *Registry) Close(id string) {
-	if b, ok := r.boards[id]; ok {
-		delete(r.boards, id)
-		b.StopQuestionExpiry()
-		r.Store.Cancel(id)
-		_ = r.Store.Write(b.Snapshot())
+// Close saves the latest board, commits the caller's durable close state, then evicts it.
+// A failed save or commit leaves the board open. The caller holds Mu.
+func (r *Registry) Close(id string, persistClosed func() error) error {
+	b, ok := r.Board(id)
+	if !ok {
+		return NotFound("board %s", id)
 	}
+	if err := r.Store.Write(b.Snapshot()); err != nil {
+		return err
+	}
+	if persistClosed != nil {
+		if err := persistClosed(); err != nil {
+			return err
+		}
+	}
+	id = b.id
+	b.closed = true
+	b.StopQuestionExpiry()
+	b.StopComposerExpiry()
+	for _, terminal := range slices.Sorted(maps.Keys(b.composerPrompts)) {
+		b.DropComposerPrompts(terminal)
+	}
+	if len(b.composerReceipts) > 0 {
+		if r.closedComposerReceipts == nil {
+			r.closedComposerReceipts = map[string][]map[string]any{}
+		}
+		r.closedComposerReceipts[id] = b.composerReceipts
+	}
+	delete(r.boards, id)
+	b.OnChange, b.OnEvent, b.OnMessagesBounced, b.OnTerminals = nil, nil, nil, nil
+	b.Viewport, b.Texts = nil, nil
+	r.Store.Cancel(id)
 	if r.Frontmost == id {
 		r.Frontmost = ""
 		if ids := r.SortedBoards(); len(ids) > 0 {
 			r.Frontmost = ids[0].id
 		}
 	}
+	r.broadcast("board.closed", map[string]any{}, id)
+	return nil
 }
 
 // Subscribe adds an event subscriber (board "" for all, events nil for all).
@@ -213,7 +270,7 @@ func (r *Registry) Subscribe(sink Sink, board string, events []string) {
 	metrics.Shared.Gauge("events.subscribers", float64(len(r.subscribers)))
 }
 
-func (r *Registry) broadcast(e model.Event, board string) {
+func (r *Registry) broadcast(name string, data any, board string) {
 	kept := r.subscribers[:0]
 	for _, s := range r.subscribers {
 		if s.sink.IsOpen() {
@@ -226,19 +283,19 @@ func (r *Registry) broadcast(e model.Event, board string) {
 	if len(kept) == 0 {
 		return
 	}
-	message := map[string]any{"event": e.Name, "board": board, "data": e.Data}
+	message := map[string]any{"event": name, "board": board, "data": data}
 	sent := false
 	for _, s := range kept {
 		if s.board != "" && s.board != board {
 			continue
 		}
-		if s.events != nil && !s.events[e.Name] {
+		if s.events != nil && !s.events[name] {
 			continue
 		}
 		sent = s.sink.Send(message) || sent
 	}
 	if sent {
-		metrics.Shared.Record("event."+e.Name, 0, 0)
+		metrics.Shared.Record("event."+name, 0, 0)
 	}
 }
 

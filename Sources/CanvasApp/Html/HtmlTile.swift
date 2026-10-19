@@ -11,13 +11,19 @@ import WebKit
 final class HtmlTile: NSView, TileContent {
     private(set) var object: CanvasObject
     private let board: Board
+    let files: HostFiles?
+    /// Remote documents and every scheme response share this in-memory policy.
+    private(set) var contentSecurityPolicy: String?
     private(set) var webView: WKWebView?
     /// `html.webviews` while `webView` exists; released with it, or with the tile when the tile
     /// goes without a `detach` (deleted from the board).
     private var webViewCount: GaugeHold?
     private var live = true
+    private(set) var hostBoardClosed = false
     private var building = false
     private var loadFailure: NSTextField?
+    private var hostImageFailure: NSTextField?
+    private var hostImageFailures: [URL: String] = [:]
     /// Last rendered image: zoomed-out cards and `view.snapshot` covers.
     private var lastSnapshot: NSImage?
     private var snapshotCover: NSImageView?
@@ -43,10 +49,14 @@ final class HtmlTile: NSView, TileContent {
     var onOpenedLink: ((ObjectID) -> Void)?
 
     /// `live: false` builds no web view (a page measured offscreen, `measure`).
-    init(object: CanvasObject, board: Board, live: Bool = true) {
+    init(object: CanvasObject, board: Board, live: Bool = true, files: HostFiles? = nil) {
         self.object = object
         self.board = board
         self.live = live
+        self.files = files
+        contentSecurityPolicy = board.isRemote
+            ? HtmlKit.contentSecurityPolicy(allow: object.props["allowNetwork"]?.array?.compactMap(\.string) ?? [])
+            : nil
         super.init(frame: NSRect(origin: .zero, size: RenderMath.body(of: object)))
         wantsLayer = true
         layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
@@ -63,6 +73,11 @@ final class HtmlTile: NSView, TileContent {
     var boardRoot: URL { board.objects[object.id] != nil ? board.linkRoot(of: object) : board.root }
     var html: String { object.props["html"]?.string ?? "" }
     private var allowNetwork: [String] { object.props["allowNetwork"]?.array?.compactMap(\.string) ?? [] }
+    var document: String {
+        HtmlKit.document(html: html, policy: contentSecurityPolicy)
+    }
+    var hostImageSource: HostFileRequest.Source { board.hostSource(props: object.props, objects: false) }
+    var isRemote: Bool { board.isRemote }
     private var pageURL: URL { HtmlKit.pageURL(tile: object.id) }
 
     // MARK: Web view lifecycle
@@ -70,14 +85,19 @@ final class HtmlTile: NSView, TileContent {
     /// The rule list compiles asynchronously; the page never loads without it (fail closed), and
     /// never with a list compiled for an allowlist that has since changed.
     private func build() {
-        guard live, webView == nil, !building else { return }
+        guard live, !hostBoardClosed, webView == nil, !building else { return }
         building = true
         let hosts = allowNetwork
+        let remote = board.isRemote
         Task { @MainActor [weak self] in
             let rules: WKContentRuleList?
             var failure: Error?
             do {
-                rules = try await HtmlRuleLists.list(allowing: hosts)
+                if remote {
+                    rules = try await HtmlRuleLists.remote()
+                } else {
+                    rules = try await HtmlRuleLists.list(allowing: hosts)
+                }
             } catch {
                 rules = nil
                 failure = error
@@ -86,21 +106,21 @@ final class HtmlTile: NSView, TileContent {
             self.building = false
             guard hosts == self.allowNetwork else { return self.build() }
             guard let rules else { return self.showFailure("Network rules failed to compile: \(failure.map(String.init(describing:)) ?? "")") }
-            guard self.live, self.webView == nil else { return }
+            guard self.live, !self.hostBoardClosed, self.webView == nil else { return }
             self.attach(rules: rules)
         }
     }
 
     /// The sandbox every page of this tile runs in: its own data store, the network rules, the
     /// kit scheme, and the validated `canvas` channel.
-    private func configuration(rules: WKContentRuleList) -> WKWebViewConfiguration {
+    private func configuration(rules: WKContentRuleList?) -> WKWebViewConfiguration {
         Self.configuration(rules: rules, scheme: HtmlSchemeHandler(tile: self), channel: HtmlChannelHandler(tile: self))
     }
 
-    static func configuration(rules: WKContentRuleList, scheme: HtmlSchemeHandler, channel: HtmlChannelHandler) -> WKWebViewConfiguration {
+    static func configuration(rules: WKContentRuleList?, scheme: HtmlSchemeHandler, channel: HtmlChannelHandler) -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        configuration.userContentController.add(rules)
+        if let rules { configuration.userContentController.add(rules) }
         configuration.setURLSchemeHandler(scheme, forURLScheme: HtmlKit.scheme)
         configuration.userContentController.addScriptMessageHandler(channel, contentWorld: .page, name: "canvas")
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
@@ -108,7 +128,7 @@ final class HtmlTile: NSView, TileContent {
         return configuration
     }
 
-    private func attach(rules: WKContentRuleList) {
+    private func attach(rules: WKContentRuleList?) {
         Metrics.shared.record("html.load")
         webViewCount = GaugeHold("html.webviews")
         let configuration = configuration(rules: rules)
@@ -122,9 +142,7 @@ final class HtmlTile: NSView, TileContent {
         addSubview(web, positioned: .below, relativeTo: nil)
         webView = web
         pageShown = false
-        loadFailure?.removeFromSuperview()
-        loadFailure = nil
-        web.load(URLRequest(url: pageURL))
+        loadPage(in: web)
     }
 
     private func detach() {
@@ -137,6 +155,7 @@ final class HtmlTile: NSView, TileContent {
         guard let web = webView else { return }
         webViewCount = nil
         web.stopLoading()
+        (web.configuration.urlSchemeHandler(forURLScheme: HtmlKit.scheme) as? HtmlSchemeHandler)?.cancelHostReads()
         web.configuration.userContentController.removeAllScriptMessageHandlers()
         web.removeFromSuperview()
         webView = nil
@@ -179,14 +198,53 @@ final class HtmlTile: NSView, TileContent {
         Self.parked.removeAll { $0.tile == nil || $0.tile === self }
     }
 
+    private func loadPage(in web: WKWebView) {
+        (web.configuration.urlSchemeHandler(forURLScheme: HtmlKit.scheme) as? HtmlSchemeHandler)?.cancelHostReads()
+        hostImageFailures.removeAll()
+        hostImageFailure?.removeFromSuperview()
+        hostImageFailure = nil
+        loadFailure?.removeFromSuperview()
+        loadFailure = nil
+        web.load(URLRequest(url: pageURL))
+    }
+
     private func showFailure(_ message: String) {
         loadFailure?.removeFromSuperview()
         let label = NSTextField(wrappingLabelWithString: message)
         label.textColor = .systemRed
+        label.drawsBackground = true
+        label.backgroundColor = .textBackgroundColor
         label.frame = bounds.insetBy(dx: 12, dy: 12)
         label.autoresizingMask = [.width, .height]
         addSubview(label)
         loadFailure = label
+        showPage()
+    }
+
+    func hostImageFinished(_ url: URL, error: Error?, in web: WKWebView) {
+        guard web === webView else { return }
+        if let error {
+            let failure = error as? HostFileError ?? .unavailable(String(describing: error))
+            hostImageFailures[url] = "\(HostGit.refusal(failure)) (\(url.lastPathComponent))"
+        } else {
+            hostImageFailures.removeValue(forKey: url)
+        }
+        hostImageFailure?.removeFromSuperview()
+        hostImageFailure = nil
+        guard let reason = hostImageFailures.first?.value else { return }
+        let message = "Host image: \(reason)"
+        let label = NSTextField(wrappingLabelWithString: message)
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = .systemRed
+        label.drawsBackground = true
+        label.backgroundColor = .textBackgroundColor
+        label.maximumNumberOfLines = 3
+        label.lineBreakMode = .byTruncatingTail
+        label.toolTip = message
+        label.frame = NSRect(x: 8, y: max(8, bounds.height - 56), width: max(0, bounds.width - 16), height: min(48, max(0, bounds.height - 16)))
+        label.autoresizingMask = [.width, .minYMargin]
+        addSubview(label)
+        hostImageFailure = label
         showPage()
     }
 
@@ -195,6 +253,7 @@ final class HtmlTile: NSView, TileContent {
     /// `rendering`: from the offscreen page `render(_:)` loads, which may read (excerpts, state)
     /// but never act for the user.
     func handle(_ message: HtmlMessage, rendering: Bool) async throws -> JSONValue {
+        guard !hostBoardClosed, !board.isClosed else { throw HtmlError.unavailable("host closed this board") }
         if rendering {
             switch message {
             case .rendered:
@@ -212,7 +271,11 @@ final class HtmlTile: NSView, TileContent {
             if let y { scrollY = y }
             pageSettled()
         }
-        let result = try await work.perform { [object, board] in try await HtmlChannel.handle(message, tile: object.id, board: board) }
+        let result = try await work.perform { [object, board, files] in
+            try Task.checkCancellation()
+            return try await HtmlChannel.handle(message, tile: object.id, board: board, files: files)
+        }
+        guard !hostBoardClosed, !board.isClosed else { throw HtmlError.cancelled }
         if case .openCode = message, let opened = result["tile"]?.string { onOpenedCode?(opened, result["existing"] == .bool(true)) }
         return result
     }
@@ -261,7 +324,19 @@ final class HtmlTile: NSView, TileContent {
 
     // MARK: TileContent
 
+    func setHostBoardClosed(_ closed: Bool) {
+        guard hostBoardClosed != closed else { return }
+        hostBoardClosed = closed
+        if closed {
+            work.cancelAll()
+            snapshotTask?.cancel()
+            webView?.stopLoading()
+            renderWebView?.stopLoading()
+        }
+    }
+
     func setLive(_ live: Bool) {
+        guard !live || !hostBoardClosed else { return }
         guard live != self.live else { return }
         self.live = live
         if live, let web = webView {
@@ -290,16 +365,16 @@ final class HtmlTile: NSView, TileContent {
     }
 
     /// Card image: the live page's last capture, else an offscreen render.
-    func cardSnapshot(_ deliver: @escaping @MainActor (NSImage?) -> Void) {
-        if let lastSnapshot { return deliver(lastSnapshot) }
+    func cardSnapshot() async -> NSImage? {
+        guard !Task.isCancelled else { return nil }
+        if let lastSnapshot { return lastSnapshot }
         let request = TileRenderRequest(size: bounds.size, scale: TileFrameView.cardPixelsPerPoint, full: false,
                                         appearance: window?.effectiveAppearance ?? NSApp.effectiveAppearance)
-        Task { @MainActor in
-            // Cards requested together (a batch of new tiles) render one per wake of the main thread.
-            await MainTurns.next()
-            let render = await self.render(request)
-            deliver(render.state == .rendered ? render.image : nil)
-        }
+        // Cards requested together (a batch of new tiles) render one per wake of the main thread.
+        await MainTurns.next()
+        guard !Task.isCancelled else { return nil }
+        let render = await self.render(request)
+        return !Task.isCancelled && render.state == .rendered ? render.image : nil
     }
 
     // MARK: Offscreen render
@@ -317,7 +392,6 @@ final class HtmlTile: NSView, TileContent {
     /// `<canvas-code>` excerpts settled), measures it, and snapshots it: the tile's window at
     /// its scroll position, or with `full` the whole page height.
     func render(_ request: TileRenderRequest) async -> TileRender {
-        guard let window else { return .placeholder(request, "the tile has no window") }
         guard await beginOffscreen() else { return .placeholder(request, "timed out waiting for another render of this tile") }
         let started = Metrics.now()
         defer {
@@ -342,8 +416,9 @@ final class HtmlTile: NSView, TileContent {
             _ = await Self.wait(until: { [unowned self] in offscreenSettled }, limit: .seconds(1))
         }
         guard !Task.isCancelled else { return .placeholder(request, "timed out") }
+        // WebKit snapshots at the backing scale of the window the page is parked in, the stage's.
         let shot = WKSnapshotConfiguration()
-        shot.snapshotWidth = NSNumber(value: Double(web.bounds.width * request.scale / max(window.backingScaleFactor, 1)))
+        shot.snapshotWidth = NSNumber(value: Double(web.bounds.width * request.scale / max(web.window?.backingScaleFactor ?? 1, 1)))
         guard let page = try? await web.takeSnapshot(configuration: shot) else {
             return TileRender(image: nil, contentSize: content, state: .failed, reason: "WebKit produced no snapshot")
         }
@@ -370,6 +445,31 @@ final class HtmlTile: NSView, TileContent {
             Metrics.shared.record("html.measure.cached")
             return known.size
         }
+        let extent = try await measure(measuredPage(props, width: width), on: Board(id: IDs.make("brd"), root: root), files: nil)
+        if let key {
+            if measured.count >= 64 { measured = measured.filter { ContinuousClock.now - $0.value.at < measureReuse } }
+            measured[key] = (extent, ContinuousClock.now)
+        }
+        return extent
+    }
+
+    /// The same for a page on remote board `board`, as its viewer measures it for the board's
+    /// easld: on a scratch board of its own (`Board.measuring`), its `<canvas-code>` excerpts and
+    /// images read on the host through `files` under the page's own root, ref and refSha, never
+    /// from this Mac's disk. Its page is never a pooled one (`loadOffscreen`), and its extent is
+    /// never reused: `measured` is keyed by path, and a path names another file on another host.
+    static func measure(props: JSONValue, width: CGFloat, remote board: Board, files: HostFiles) async throws -> CGSize {
+        let page = measuredPage(props, width: width)
+        return try await measure(page, on: .measuring(page, on: board), files: files)
+    }
+
+    /// The throwaway object a page is measured in: `width` wide, its body 1 pt tall.
+    private static func measuredPage(_ props: JSONValue, width: CGFloat) -> CanvasObject {
+        CanvasObject(id: IDs.make("obj"), type: .html, frame: Frame(x: 0, y: 0, w: Double(width), h: RenderMath.tileTitleHeight + 1),
+                     z: 0, createdBy: .user, createdAt: Date(), props: props)
+    }
+
+    private static func measure(_ page: CanvasObject, on board: Board, files: HostFiles?) async throws -> CGSize {
         let queued = Metrics.now()
         while measuring >= maxMeasuring {
             try Task.checkCancellation()
@@ -382,21 +482,15 @@ final class HtmlTile: NSView, TileContent {
             measuring -= 1
             Metrics.shared.record("html.measure", ms: (Metrics.now() - started) * 1000)
         }
-        let object = CanvasObject(id: IDs.make("obj"), type: .html, frame: Frame(x: 0, y: 0, w: Double(width), h: RenderMath.tileTitleHeight + 1),
-                                  z: 0, createdBy: .user, createdAt: Date(), props: props)
-        let tile = HtmlTile(object: object, board: Board(id: IDs.make("brd"), root: root), live: false)
+        let tile = HtmlTile(object: page, board: board, live: false, files: files)
         guard await tile.beginOffscreen() else { throw ObjectMeasure.Failure.unavailable("the page is busy") }
         var measuredFine = false
         // A page that failed or was cancelled may be stuck (a script that never yields): it is
         // discarded, never emptied for reuse (`HtmlMeasurePool`).
         defer { tile.endOffscreen(keepPage: measuredFine && !Task.isCancelled) }
-        switch await tile.loadOffscreen(size: CGSize(width: width, height: 1), appearance: NSApp.effectiveAppearance, limit: measureLimit, pooled: true) {
+        switch await tile.loadOffscreen(size: CGSize(width: page.frame.w, height: 1), appearance: NSApp.effectiveAppearance, limit: measureLimit, pooled: true) {
         case .success(let extent):
             measuredFine = true
-            if let key {
-                if measured.count >= 64 { measured = measured.filter { ContinuousClock.now - $0.value.at < measureReuse } }
-                measured[key] = (extent, ContinuousClock.now)
-            }
             return extent
         case .failure(.rules(let reason)), .failure(.unsettled(let reason)): throw ObjectMeasure.Failure.unavailable("cannot measure the page: \(reason)")
         }
@@ -468,12 +562,16 @@ final class HtmlTile: NSView, TileContent {
     private func loadOffscreen(size: CGSize, appearance: NSAppearance, limit: Duration = .seconds(60), pooled: Bool = false) async -> Result<CGSize, OffscreenFailure> {
         let rules: WKContentRuleList
         do {
-            rules = try await HtmlRuleLists.list(allowing: allowNetwork)
+            if board.isRemote {
+                rules = try await HtmlRuleLists.remote()
+            } else {
+                rules = try await HtmlRuleLists.list(allowing: allowNetwork)
+            }
         } catch {
             return .failure(.rules("network rules failed to compile: \(error)"))
         }
         let web: HtmlWebView
-        if pooled {
+        if pooled, !board.isRemote {
             let page = HtmlMeasurePool.take(for: self, rules: rules)
             measurePage = page
             web = page.web
@@ -491,8 +589,15 @@ final class HtmlTile: NSView, TileContent {
         web.load(URLRequest(url: pageURL))
         guard await Self.wait(until: { [unowned self] in offscreenSettled }, limit: limit) else { return .failure(.unsettled("the page did not finish rendering")) }
         let measure = "[Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0), Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)]"
-        let extent = (try? await web.evaluateJavaScript(measure)) as? [Double] ?? []
-        return .success(CGSize(width: extent.first ?? size.width, height: extent.count > 1 ? extent[1] : size.height))
+        do {
+            guard let extent = try await web.evaluateJavaScript(measure) as? [Double],
+                  extent.count == 2, extent.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                return .failure(.unsettled("cannot read the page's dimensions"))
+            }
+            return .success(CGSize(width: extent[0], height: extent[1]))
+        } catch {
+            return .failure(.unsettled("cannot read the page's dimensions"))
+        }
     }
 
     /// Polls `condition` until it holds, the task is cancelled (the render deadline), or `limit` passes.
@@ -518,9 +623,12 @@ final class HtmlTile: NSView, TileContent {
 
     func update(_ object: CanvasObject) {
         let previous = self.object
-        self.object = object
-        guard let web = webView else { return }
         let networkChanged = (object.props["allowNetwork"] ?? .array([])) != (previous.props["allowNetwork"] ?? .array([]))
+        self.object = object
+        if networkChanged, board.isRemote {
+            contentSecurityPolicy = HtmlKit.contentSecurityPolicy(allow: allowNetwork)
+        }
+        guard let web = webView else { return }
         if !live, networkChanged || object.props["html"] != previous.props["html"] {
             // A parked page would load again unseen: release it; the card shows the change.
             detach()
@@ -530,7 +638,7 @@ final class HtmlTile: NSView, TileContent {
         } else if object.props["html"] != previous.props["html"] {
             Metrics.shared.record("html.reload")
             work.cancelAll()
-            web.load(URLRequest(url: pageURL))
+            loadPage(in: web)
         } else if object.props["state"] != previous.props["state"] {
             let state = (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(object.props["state"] ?? .object([:])))) ?? [String: Any]()
             Task { _ = try? await web.callAsyncJavaScript("window.canvasKit?.receiveState(state)", arguments: ["state": state], contentWorld: .page) }
@@ -609,6 +717,7 @@ extension HtmlTile: WKNavigationDelegate, WKUIDelegate {
     /// Every other navigation off the page (a timer setting `location.href`, an iframe's `src`)
     /// is cancelled.
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
+        guard !hostBoardClosed, !board.isClosed else { return .cancel }
         guard let url = action.request.url else { return .cancel }
         let isMain = action.targetFrame?.isMainFrame ?? true
         let userLink = action.targetFrame == nil || (action.navigationType == .linkActivated && isMain)
@@ -625,7 +734,13 @@ extension HtmlTile: WKNavigationDelegate, WKUIDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        webView.load(URLRequest(url: pageURL))
+        guard !hostBoardClosed, !board.isClosed else { return }
+        if webView === self.webView {
+            loadPage(in: webView)
+        } else {
+            (webView.configuration.urlSchemeHandler(forURLScheme: HtmlKit.scheme) as? HtmlSchemeHandler)?.cancelHostReads()
+            webView.load(URLRequest(url: pageURL))
+        }
     }
 
     /// A new window the policy above let through (it opened as a link already when it could):
@@ -639,12 +754,15 @@ extension HtmlTile: WKNavigationDelegate, WKUIDelegate {
     /// one (`Board.openLink`, a tile already showing it is reused), or in the default browser
     /// with ⌥ held.
     private func followed(_ action: WKNavigationAction, in webView: WKWebView) -> Bool {
+        guard !hostBoardClosed, !board.isClosed else { return false }
         guard let url = action.request.url, WebLink.isWeb(url), let click = (webView as? HtmlWebView)?.recentClick() else { return false }
         if click.union(action.modifierFlags).contains(.option) {
-            ExternalOpen.open(url, because: "html \(object.id) link (⌥-click)")
+            ExternalOpen.open(url, because: board.isRemote ? "remote html link (⌥-click)" : "html \(object.id) link (⌥-click)", naming: !board.isRemote)
         } else {
             let opened = board.openLink(url, near: object.id, caller: nil)
-            NSLog("easl: html %@ link %@ → %@ %@", object.id, url.absoluteString, opened.existing ? "existing browser tile" : "new browser tile", opened.object.id)
+            if !board.isRemote {
+                NSLog("easl: html %@ link %@ → %@ %@", object.id, url.absoluteString, opened.existing ? "existing browser tile" : "new browser tile", opened.object.id)
+            }
             onOpenedLink?(opened.object.id)
         }
         return true

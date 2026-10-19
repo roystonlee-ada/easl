@@ -2,6 +2,7 @@ package router
 
 import (
 	"errors"
+	"math"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -21,8 +22,8 @@ import (
 // write is object.create/update/upsert as ApiRouter.handle runs them: an upsert resolved to its
 // create or update, paths taken into the caller's checkout, refs resolved, note ranges
 // anchored, a duplicate changes tile reused, `size: "fit"` measured, overlaps reported.
-func (r *Router) write(method string, p map[string]any) (any, error) {
-	result, err := r.writeObject(method, p)
+func (r *Router) write(method string, p map[string]any, from Conn) (any, error) {
+	result, err := r.writeObject(method, p, from)
 	if err == nil {
 		r.reanchorCode(asMap(asMap(result)["object"])["id"])
 	}
@@ -45,7 +46,7 @@ func (r *Router) reanchorCode(id any) {
 	}
 }
 
-func (r *Router) writeObject(method string, p map[string]any) (any, error) {
+func (r *Router) writeObject(method string, p map[string]any, from Conn) (any, error) {
 	upsert := method == "object.upsert"
 	params := p
 	if upsert {
@@ -66,13 +67,21 @@ func (r *Router) writeObject(method string, p map[string]any) (any, error) {
 		return nil, err
 	}
 	if method == "object.create" {
+		if params["type"] == string(model.HTML) && params["size"] == "fit" {
+			b, err := r.boardOf(params)
+			if err != nil {
+				return nil, err
+			}
+			params = copyParams(params)
+			params["board"] = b.ID()
+		}
 		if _, keyed := board.Key(asMap(params["props"])); !keyed {
 			reused, err := r.reusableChanges(params)
 			if err != nil {
 				return nil, err
 			}
 			if reused != nil {
-				size, err := r.fitSize("object.update", reused, nil)
+				size, err := r.fitSize("object.update", reused, nil, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -80,7 +89,7 @@ func (r *Router) writeObject(method string, p map[string]any) (any, error) {
 				if err != nil {
 					return nil, err
 				}
-				res, err := r.dispatch("object.update", fitted)
+				res, err := r.dispatch("object.update", fitted, from)
 				if err != nil {
 					return nil, err
 				}
@@ -93,7 +102,7 @@ func (r *Router) writeObject(method string, p map[string]any) (any, error) {
 			}
 		}
 	}
-	size, err := r.fitSize(method, params, nil)
+	size, err := r.fitSize(method, params, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +121,7 @@ func (r *Router) writeObject(method string, p map[string]any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	res, err := r.dispatch(method, fitted)
+	res, err := r.dispatch(method, fitted, from)
 	if err != nil {
 		return nil, err
 	}
@@ -135,8 +144,12 @@ func withApproximate(result map[string]any, size *fit) map[string]any {
 	return result
 }
 
-func (r *Router) create(p map[string]any) (any, error) {
+func (r *Router) create(p map[string]any, from Conn) (any, error) {
 	b, err := r.boardOf(p)
+	if err != nil {
+		return nil, err
+	}
+	edit, err := board.ParseViewerEdit(p)
 	if err != nil {
 		return nil, err
 	}
@@ -194,8 +207,20 @@ func (r *Router) create(p map[string]any) (any, error) {
 			return nil, err
 		}
 	}
+	if typ == model.Browser {
+		props, err = r.withDrawing(b, props, from)
+		if err != nil {
+			return nil, err
+		}
+	}
 	parent, _ := optStr(p, "parent")
-	o := b.Create(typ, props, frame, parent, caller)
+	var o model.Object
+	if err := b.AsViewerEdit(edit, func() error {
+		o = b.Create(typ, props, frame, parent, caller)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 	return withWarnings(map[string]any{"object": objectJSON(b.ReportedOne(o))}, typ.UnknownPropWarnings(props)), nil
 }
 
@@ -211,6 +236,18 @@ func (r *Router) update(p map[string]any) (any, error) {
 	if err := checkProps(p); err != nil {
 		return nil, err
 	}
+	edit, err := board.ParseViewerEdit(p)
+	if err != nil {
+		return nil, err
+	}
+	var z *float64
+	if value, present := p["z"]; present {
+		n, ok := value.(float64)
+		if !ok || math.IsNaN(n) || math.IsInf(n, 0) {
+			return nil, invalid("z must be a finite number")
+		}
+		z = &n
+	}
 	current, err := b.Object(id)
 	if err != nil {
 		return nil, err
@@ -224,6 +261,11 @@ func (r *Router) update(p map[string]any) (any, error) {
 		frame = &f
 	}
 	props := asMap(p["props"])
+	if props != nil && current.Type == model.Browser {
+		if err := validateDrawing(props["drawingMachine"]); err != nil {
+			return nil, err
+		}
+	}
 	if root, ok := props["root"].(string); ok && root != "" && (current.Type == model.Note || current.Type == model.HTML) {
 		if err := b.CheckLinkRoot(root); err != nil {
 			return nil, err
@@ -244,8 +286,12 @@ func (r *Router) update(p map[string]any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	o, err := b.Update(id, rev, frame, nil, written, caller, "")
-	if err != nil {
+	var o model.Object
+	if err := b.AsViewerEdit(edit, func() error {
+		var err error
+		o, err = b.Update(id, rev, frame, z, written, caller, "")
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	return withWarnings(map[string]any{"object": objectJSON(b.ReportedOne(o))}, o.Type.UnknownPropWarnings(props)), nil
@@ -421,7 +467,7 @@ func (r *Router) objectGet(p map[string]any) (any, error) {
 // A browser's page report, a terminal's last command (app closures) and a changes tile's
 // `changes` (git diff, ChangeSet) aren't there.
 func (r *Router) get(p map[string]any) (any, error) {
-	res, err := r.dispatch("object.get", p)
+	res, err := r.dispatch("object.get", p, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -445,7 +491,7 @@ func (r *Router) get(p map[string]any) (any, error) {
 		if !ok {
 			return result, nil
 		}
-		current, err := r.dispatch("object.get", p)
+		current, err := r.dispatch("object.get", p, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -808,6 +854,11 @@ func (r *Router) reusableChanges(p map[string]any) (map[string]any, error) {
 	if s, ok := p["size"]; ok {
 		update["size"] = s
 	}
+	for _, k := range []string{"viewer", "step"} {
+		if v, ok := p[k]; ok {
+			update[k] = v
+		}
+	}
 	return update, nil
 }
 
@@ -1038,7 +1089,7 @@ func contains(list []string, s string) bool {
 }
 
 // anchored is params with a note's markdown anchored the way its tile writes it back
-// (NoteMarkdown.anchoringRanges), so the result's rev is the one the next update needs.
+// (NoteMarkdown.anchoringRanges(_:reading:within:captured:)), so the result's rev is the one the next update needs.
 func (r *Router) anchored(method string, p map[string]any, pending map[int]map[string]any) (map[string]any, error) {
 	props, ok := p["props"].(map[string]any)
 	if !ok {
@@ -1090,13 +1141,7 @@ func (r *Router) anchored(method string, p map[string]any, pending map[int]map[s
 			merged = model.Merge(note.Props, props).(map[string]any)
 		}
 	}
-	linkRoot := b.LinkRoot(merged)
-	var reading measure.LinkReading
-	if _, hasRef := board.RefOf(merged); hasRef {
-		reading = measure.ReadingFor(merged, b.Root())
-	} else {
-		reading = measure.LinkReading{Root: linkRoot}
-	}
+	reading := measure.ReadingFor(merged, b.Root())
 	text := mention.AnchoringRanges(markdown, reading)
 	if text == markdown {
 		return p, nil
@@ -1124,8 +1169,9 @@ type fit struct {
 }
 
 // fitSize is the measured size an object.create/update with `size: "fit"` gets, or a note or
-// image created without a frame height; nil otherwise.
-func (r *Router) fitSize(method string, p map[string]any, pending map[int]map[string]any) (*fit, error) {
+// image created without a frame height; nil otherwise. guard is the batch plan's inputs; a
+// single write guards only this fit (board identity, and the object's rev when one was read).
+func (r *Router) fitSize(method string, p map[string]any, state *batchState, guard *fitGuard) (*fit, error) {
 	frame := asMap(p["frame"])
 	_, hasH := frame["h"]
 	fitsNote := method == "object.create" && (p["type"] == string(model.Note) || p["type"] == string(model.Image)) && !hasH
@@ -1143,6 +1189,7 @@ func (r *Router) fitSize(method string, p map[string]any, pending map[int]map[st
 	if w, ok := frame["w"].(float64); ok {
 		width = &w
 	}
+	caller := stringOf(p["caller"])
 	if method == "object.create" {
 		typeName, err := str(p, "type")
 		if err != nil {
@@ -1160,7 +1207,13 @@ func (r *Router) fitSize(method string, p map[string]any, pending map[int]map[st
 		if err != nil {
 			return nil, err
 		}
-		w, h, approximate, err := measure.Size(typ, props, width, pathRoot(b, typ, props), r.clients)
+		g := guard
+		if typ == model.HTML && g == nil {
+			g = newFitGuard(b)
+		} else if g != nil {
+			g.keep(b)
+		}
+		w, h, approximate, err := r.measuredSize(typ, props, width, b, caller, g)
 		if err != nil {
 			return nil, err
 		}
@@ -1170,41 +1223,23 @@ func (r *Router) fitSize(method string, p map[string]any, pending map[int]map[st
 	if err != nil {
 		return nil, err
 	}
+	if _, isRef := reference(id); state == nil && isRef {
+		return nil, invalid("%s must name an earlier create op", id)
+	}
 	var typ model.ObjectType
 	var props map[string]any
 	var baseWidth *float64
-	var root string
-	if index, isRef := reference(id); isRef {
-		created, ok := pending[index]
-		if !ok {
-			return nil, invalid("%s must name an earlier create op", id)
-		}
-		typeName, err := str(created, "type")
+	var b *board.Board
+	if state != nil {
+		o, err := state.object(id)
 		if err != nil {
 			return nil, err
 		}
-		t, ok := model.ParseObjectType(typeName)
-		if !ok {
-			return nil, invalid("%s must name an earlier create op", id)
-		}
-		typ = t
-		props = asMap(created["props"])
-		if props == nil {
-			props = map[string]any{}
-		}
-		if patch, ok := p["props"]; ok {
-			props, _ = model.Merge(props, patch).(map[string]any)
-		}
-		if w, ok := asMap(created["frame"])["w"].(float64); ok {
-			baseWidth = &w
-		}
-		b, err := r.boardOf(created)
-		if err != nil {
-			return nil, err
-		}
-		root = pathRoot(b, typ, props)
+		b, typ, props = state.live, o.Type, o.Props
+		w := o.Frame.W
+		baseWidth = &w
 	} else {
-		b, err := r.boardForObject(id)
+		b, err = r.boardForObject(id)
 		if err != nil {
 			return nil, err
 		}
@@ -1213,17 +1248,21 @@ func (r *Router) fitSize(method string, p map[string]any, pending map[int]map[st
 			return nil, err
 		}
 		typ, props = o.Type, o.Props
-		if patch, ok := p["props"]; ok {
-			props, _ = model.Merge(props, patch).(map[string]any)
-		}
 		w := o.Frame.W
 		baseWidth = &w
-		root = pathRoot(b, typ, props)
+	}
+	if patch, ok := p["props"]; ok {
+		props, _ = model.Merge(props, patch).(map[string]any)
 	}
 	if width == nil && typ != model.Code && typ != model.Image {
 		width = baseWidth
 	}
-	w, h, approximate, err := measure.Size(typ, props, width, root, r.clients)
+	g := guard
+	if typ == model.HTML && g == nil {
+		g = newFitGuard(b)
+	}
+	g.note(b, id)
+	w, h, approximate, err := r.measuredSize(typ, props, width, b, caller, g)
 	if err != nil {
 		return nil, err
 	}

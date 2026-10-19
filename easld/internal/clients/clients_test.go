@@ -2,6 +2,7 @@ package clients
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -43,6 +44,21 @@ func (f *fakeConn) Done() <-chan struct{} { return f.done }
 
 func (f *fakeConn) hangUp() { f.once.Do(func() { close(f.done) }) }
 
+type enqueueGateConn struct {
+	*fakeConn
+	started chan struct{}
+	release chan struct{}
+	gate    sync.Once
+}
+
+func (c *enqueueGateConn) Send(v any) bool {
+	c.gate.Do(func() {
+		close(c.started)
+		<-c.release
+	})
+	return c.fakeConn.Send(v)
+}
+
 // request is the next request the registry sent the client.
 func (f *fakeConn) request(t *testing.T) map[string]any {
 	t.Helper()
@@ -64,7 +80,7 @@ func current(app, host string, serves []string, boards []string, focused string)
 
 func attach(t *testing.T, r *Registry, conn Conn, a Attachment) *Client {
 	t.Helper()
-	c, err := r.Attach(conn, a)
+	c, _, err := r.Attach(conn, a)
 	if err != nil {
 		t.Fatalf("attach %+v: %v", a, err)
 	}
@@ -131,11 +147,11 @@ func TestAttachRefusesAnOlderSchemaVersionAndTakesTheSameOrANewerOne(t *testing.
 	r := New()
 	older := current("0.1.0", "studio", []string{"view.get"}, []string{board}, board)
 	older.Version, older.Schema = api.SchemaVersion-1, "5a0c1d7e9b3f2a64"
-	_, err := r.Attach(newConn(), older)
+	_, _, err := r.Attach(newConn(), older)
 	failure, _ := err.(*Failure)
 	expectFailure(t, failure, api.CodeUnavailable, fmt.Sprintf("easl 0.1.0 on studio is older than this board's server (schema version %d, the server's %d); update it", api.SchemaVersion-1, api.SchemaVersion))
 	unnamed := Attachment{Version: api.SchemaVersion - 1, Schema: older.Schema, Serves: older.Serves}
-	_, err = r.Attach(newConn(), unnamed)
+	_, _, err = r.Attach(newConn(), unnamed)
 	failure, _ = err.(*Failure)
 	expectFailure(t, failure, api.CodeUnavailable, fmt.Sprintf("a client is older than this board's server (schema version %d, the server's %d); update it", api.SchemaVersion-1, api.SchemaVersion))
 	if r.Clients() != 0 || r.Choose("view.get", board) != nil {
@@ -162,9 +178,68 @@ func TestAttachRefusesAnOlderSchemaVersionAndTakesTheSameOrANewerOne(t *testing.
 
 func TestAttachRefusesAFocusOutsideItsBoards(t *testing.T) {
 	r := New()
-	_, err := r.Attach(newConn(), current("0.2.0", "studio", []string{"view.get"}, []string{"brd_a"}, "brd_b"))
+	_, _, err := r.Attach(newConn(), current("0.2.0", "studio", []string{"view.get"}, []string{"brd_a"}, "brd_b"))
 	failure, _ := err.(*Failure)
 	expectFailure(t, failure, api.CodeInvalidParams, "focused names brd_b, which isn't one of boards")
+}
+
+func TestExactLookupTakesTheNewestEligibleLinkAndEarliestIgnoresFocus(t *testing.T) {
+	r := New()
+	olderConn := newConn()
+	older := current("0.2.0", "home", []string{"browser.call", "object.reload"}, []string{board}, board)
+	older.Identity = "mch_home"
+	olderClient := attach(t, r, olderConn, older)
+	later := current("0.2.0", "work", []string{"browser.call", "object.reload"}, []string{board}, board)
+	later.Identity = "mch_work"
+	attach(t, r, newConn(), later)
+	again := current("0.2.0", "home", []string{"browser.call"}, []string{board}, "")
+	again.Identity = "mch_home"
+	newest := attach(t, r, newConn(), again)
+	if got := r.ChooseExact("mch_home", board, "browser.call"); got != newest {
+		t.Fatalf("exact browser.call = %v, want the newest home link %s", got, newest.ID)
+	}
+	if got := r.ChooseExact("mch_home", board, "object.reload"); got != olderClient {
+		t.Fatalf("exact object.reload = %v, want the older link that still serves it", got)
+	}
+	if r.ChooseExact("mch_home", "brd_other", "browser.call") != nil || r.ChooseExact("mch_missing", board, "browser.call") != nil {
+		t.Fatal("exact lookup matched the wrong board or identity")
+	}
+	if r.Choose("object.reload", board) == nil {
+		t.Fatal("focus routing still has to work for non-browser calls")
+	}
+	owner, ok := r.Earliest(board)
+	if !ok || owner.Identity != "mch_home" || owner.Host != "home" {
+		t.Fatalf("earliest %+v %v, want home", owner, ok)
+	}
+	listed := r.List()
+	if len(listed) != 3 || listed[0].Identity == "" {
+		t.Fatalf("list omitted identity: %+v", listed)
+	}
+}
+
+func TestDetachHookRunsAfterTheRegistryLockIsReleased(t *testing.T) {
+	r := New()
+	ran := make(chan []string, 1)
+	r.OnPresence(func(boards []string) {
+		r.List()
+		ran <- boards
+	})
+	conn := newConn()
+	a := current("0.2.0", "home", []string{"browser.call"}, []string{board}, "")
+	a.Identity = "mch_home"
+	attach(t, r, conn, a)
+	conn.hangUp()
+	select {
+	case boards := <-ran:
+		if len(boards) != 1 || boards[0] != board {
+			t.Fatalf("detach boards %v", boards)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("detach hook did not run after releasing the registry lock")
+	}
+	if r.HasIdentity("mch_home", board) {
+		t.Fatal("the hung-up client was still attached")
+	}
 }
 
 func TestCallRelaysTheClientsResultOrError(t *testing.T) {
@@ -181,7 +256,7 @@ func TestCallRelaysTheClientsResultOrError(t *testing.T) {
 	call := func() chan outcome {
 		out := make(chan outcome, 1)
 		go func() {
-			result, failure := r.Call(c, "view.get", map[string]any{"board": board}, 5*time.Second)
+			result, failure := r.Call(context.Background(), c, board, "view.get", map[string]any{"board": board}, 5*time.Second)
 			out <- outcome{result, failure}
 		}()
 		return out
@@ -218,7 +293,7 @@ func TestCallFailsUnavailableAtItsDeadlineAndDropsTheLateAnswer(t *testing.T) {
 	conn := newConn()
 	c := attach(t, r, conn, current("0.2.0", "studio", []string{"view.get"}, []string{board}, board))
 	start := time.Now()
-	_, failure := r.Call(c, "view.get", map[string]any{"board": board}, 50*time.Millisecond)
+	_, failure := r.Call(context.Background(), c, board, "view.get", map[string]any{"board": board}, 50*time.Millisecond)
 	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
 		t.Errorf("gave up after %v", elapsed)
 	}
@@ -231,7 +306,7 @@ func TestCallFailsUnavailableAtItsDeadlineAndDropsTheLateAnswer(t *testing.T) {
 	// The next call waits for its own answer.
 	done := make(chan *Failure, 1)
 	go func() {
-		_, failure := r.Call(c, "view.get", map[string]any{"board": board}, 5*time.Second)
+		_, failure := r.Call(context.Background(), c, board, "view.get", map[string]any{"board": board}, 5*time.Second)
 		done <- failure
 	}()
 	next := conn.request(t)
@@ -250,7 +325,7 @@ func TestCallFailsUnavailableWhenTheClientDisconnects(t *testing.T) {
 	c := attach(t, r, conn, current("0.2.0", "studio", []string{"view.render"}, []string{board}, board))
 	done := make(chan *Failure, 1)
 	go func() {
-		_, failure := r.Call(c, "view.render", map[string]any{"board": board}, time.Minute)
+		_, failure := r.Call(context.Background(), c, board, "view.render", map[string]any{"board": board}, time.Minute)
 		done <- failure
 	}()
 	conn.request(t)
@@ -268,7 +343,7 @@ func TestCallFailsUnavailableWhenTheClientDisconnects(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	_, failure := r.Call(c, "view.render", map[string]any{"board": board}, time.Minute)
+	_, failure := r.Call(context.Background(), c, board, "view.render", map[string]any{"board": board}, time.Minute)
 	expectFailure(t, failure, api.CodeUnavailable, "easl 0.2.0 on studio (client "+c.ID+") disconnected before answering view.render")
 }
 
@@ -315,7 +390,7 @@ func TestAnAnswerIsNotQueuedBehindTheClientsOwnRequest(t *testing.T) {
 		m := req.(map[string]any)
 		switch m["method"] {
 		case "attach":
-			if _, err := r.Attach(c, current("0.2.0", "studio", []string{"text.measure"}, nil, "")); err != nil {
+			if _, _, err := r.Attach(c, current("0.2.0", "studio", []string{"text.measure"}, nil, "")); err != nil {
 				return map[string]any{"id": m["id"], "ok": false, "error": map[string]any{"code": "internal", "message": err.Error()}}
 			}
 			return map[string]any{"id": m["id"], "ok": true, "result": map[string]any{}}
@@ -369,5 +444,188 @@ func TestAnAnswerIsNotQueuedBehindTheClientsOwnRequest(t *testing.T) {
 	result, _ := reply["result"].(map[string]any)
 	if reply["id"] != "r2" || result["w"] != 98.0 || result["h"] != 28.0 || result["approximate"] != false {
 		t.Fatalf("the client's own request got %v, want the size it answered", reply)
+	}
+}
+
+func TestCancelledCallReleasesPendingAnswerWithoutClosingTheClient(t *testing.T) {
+	r := New()
+	conn := newConn()
+	t.Cleanup(conn.hangUp)
+	c := attach(t, r, conn, current("0.2.0", "studio", []string{"object.reload"}, []string{board}, board))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan *Failure, 1)
+	go func() {
+		_, failure := r.Call(ctx, c, board, "object.reload", map[string]any{"id": "obj_old"}, time.Minute)
+		done <- failure
+	}()
+	old := conn.request(t)
+	cancel()
+	select {
+	case failure := <-done:
+		expectFailure(t, failure, api.CodeUnavailable, "easl 0.2.0 on studio (client "+c.ID+")'s object.reload was cancelled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled call retained its waiter")
+	}
+	r.mu.Lock()
+	pending := len(r.pending)
+	r.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("cancelled call retained %d pending answers", pending)
+	}
+	next := make(chan any, 1)
+	go func() {
+		result, failure := r.Call(context.Background(), c, board, "object.reload", map[string]any{"id": "obj_new"}, time.Minute)
+		if failure != nil {
+			next <- failure
+			return
+		}
+		next <- result
+	}()
+	request := conn.request(t)
+	r.Answer(conn, map[string]any{"id": old["id"], "ok": true, "result": map[string]any{"id": "obj_old", "loaded": true}})
+	r.Answer(conn, map[string]any{"id": request["id"], "ok": true, "result": map[string]any{"id": "obj_new", "loaded": true}})
+	select {
+	case result := <-next:
+		value, ok := result.(map[string]any)
+		if !ok || value["id"] != "obj_new" || value["loaded"] != true || r.Choose("object.reload", board) != c {
+			t.Fatalf("new call inherited cancelled state or lost its client: %v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("new call did not receive its own answer")
+	}
+}
+
+func TestRemoveBoardFailsOnlyItsCallsAndKeepsTheClientServingOtherBoards(t *testing.T) {
+	r := New()
+	conn := newConn()
+	t.Cleanup(conn.hangUp)
+	c := attach(t, r, conn, current("0.2.0", "studio", []string{"object.reload"}, []string{board, "brd_b"}, board))
+	type outcome struct {
+		result  any
+		failure *Failure
+	}
+	call := func(id string) <-chan outcome {
+		done := make(chan outcome, 1)
+		go func() {
+			result, failure := r.Call(context.Background(), c, id, "object.reload", map[string]any{"id": "obj_" + id}, time.Minute)
+			done <- outcome{result, failure}
+		}()
+		return done
+	}
+	closed := call(board)
+	old := conn.request(t)
+	other := call("brd_b")
+	request := conn.request(t)
+	r.RemoveBoard(board)
+	select {
+	case got := <-closed:
+		expectFailure(t, got.failure, api.CodeNotFound, "board brd_a was closed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("closed board retained its delegated call")
+	}
+	if got := r.List(); len(got) != 1 || got[0].Focused != "" || len(got[0].Boards) != 1 || got[0].Boards[0] != "brd_b" {
+		t.Fatalf("client retained closed board or lost other board: %+v", got)
+	}
+	if r.Choose("object.reload", board) != nil || r.Choose("object.reload", "brd_b") != c {
+		t.Fatal("closed board remains routable or other board lost its client")
+	}
+	_, failure := r.Call(context.Background(), c, board, "object.reload", map[string]any{"id": "obj_stale"}, time.Minute)
+	expectFailure(t, failure, api.CodeNotFound, "board brd_a was closed")
+	if !r.Answer(conn, map[string]any{"id": old["id"], "ok": true, "result": map[string]any{"loaded": true}}) {
+		t.Fatal("late answer to closed board was not discarded")
+	}
+	r.Answer(conn, map[string]any{"id": request["id"], "ok": true, "result": map[string]any{"id": "obj_b", "loaded": true}})
+	select {
+	case got := <-other:
+		result, ok := got.result.(map[string]any)
+		if got.failure != nil || !ok || result["id"] != "obj_b" || result["loaded"] != true {
+			t.Fatalf("other board call failed: %+v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("other board did not receive its delegated result")
+	}
+}
+
+func TestRemoveBoardCannotRejectThenEnqueueAnOverlappingPrompt(t *testing.T) {
+	r := New()
+	conn := &enqueueGateConn{fakeConn: newConn(), started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(conn.hangUp)
+	release := sync.OnceFunc(func() { close(conn.release) })
+	t.Cleanup(release)
+	c := attach(t, r, conn, current("0.2.0", "studio", []string{"agent.prompt", "view.get", "text.measure"}, []string{board, "brd_b"}, board))
+	closed := make(chan *Failure, 1)
+	go func() {
+		_, failure := r.Call(context.Background(), c, board, "agent.prompt", map[string]any{"target": "term_a", "text": "late prompt"}, time.Minute)
+		closed <- failure
+	}()
+	select {
+	case <-conn.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("prompt did not reach the enqueue boundary")
+	}
+
+	var queuedAtClose int
+	// Expose an unprotected enqueue to closure, or let a protected enqueue finish first.
+	if r.mu.TryLock() {
+		r.mu.Unlock()
+		r.RemoveBoard(board)
+		queuedAtClose = len(conn.sent)
+		release()
+	} else {
+		release()
+		r.RemoveBoard(board)
+		queuedAtClose = len(conn.sent)
+	}
+	select {
+	case failure := <-closed:
+		expectFailure(t, failure, api.CodeNotFound, "board brd_a was closed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("closed board retained its overlapping prompt")
+	}
+	if got := len(conn.sent); got != queuedAtClose {
+		t.Fatalf("closed board enqueued a prompt after removal returned: %d queued at close, %d afterward", queuedAtClose, got)
+	}
+	request := conn.request(t)
+	params, _ := request["params"].(map[string]any)
+	if request["method"] != "agent.prompt" || params["target"] != "term_a" || params["text"] != "late prompt" {
+		t.Fatalf("client received %v, want the prompt that won dispatch before closure", request)
+	}
+	_, failure := r.Call(context.Background(), c, board, "agent.prompt", map[string]any{"target": "term_a", "text": "must not be typed"}, time.Minute)
+	expectFailure(t, failure, api.CodeNotFound, "board brd_a was closed")
+
+	for _, next := range []struct {
+		board, method, result string
+	}{
+		{"brd_b", "view.get", "other board answer"},
+		{"", "text.measure", "global answer"},
+	} {
+		done := make(chan answer, 1)
+		go func() {
+			result, failure := r.Call(context.Background(), c, next.board, next.method, map[string]any{"board": next.board}, time.Minute)
+			done <- answer{result: result, failure: failure}
+		}()
+		request := conn.request(t)
+		params, _ := request["params"].(map[string]any)
+		if request["method"] != next.method || params["board"] != next.board {
+			t.Fatalf("client received %v after close, want %s on %q", request, next.method, next.board)
+		}
+		r.Answer(conn, map[string]any{"id": request["id"], "ok": true, "result": next.result})
+		select {
+		case got := <-done:
+			if got.failure != nil || got.result != next.result {
+				t.Fatalf("%s after close returned %+v, want %q", next.method, got, next.result)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s after close did not receive its answer", next.method)
+		}
+	}
+	select {
+	case <-conn.Done():
+		t.Fatal("board removal disconnected the client")
+	default:
+	}
+	if got := len(conn.sent); got != 0 {
+		t.Fatalf("client received %d unexpected requests after close", got)
 	}
 }

@@ -62,6 +62,12 @@ public final class BoardStore {
         if let data = try? Data(contentsOf: url(for: id)), var snapshot = try? Self.decoder.decode(BoardSnapshot.self, from: data) {
             // The root may have moved (renamed checkout); the board follows its identity.
             snapshot.root = root.path
+            let scrubbed = BoardAnchorScrub.normalize(snapshot)
+            if let scrubbed { snapshot = scrubbed }
+            let archived = snapshot.archiveDueQuestions(now: Date())
+            if scrubbed != nil || archived, let data = try? Self.encoder.encode(snapshot) {
+                try? data.write(to: url(for: id), options: .atomic)
+            }
             board = Board(snapshot: snapshot)
         } else {
             board = Board(id: id, root: root)
@@ -131,6 +137,7 @@ public final class BoardStore {
     }
 
     public func scheduleSave(_ board: Board) {
+        guard !board.isClosed else { return }
         Metrics.shared.record("save.scheduled")
         if let pending = pendingSaves[board.id] {
             pending.cancel()
@@ -145,9 +152,15 @@ public final class BoardStore {
     }
 
     public func save(_ board: Board) {
+        try? saveChecked(board)
+    }
+
+    /// Saves the latest state before a close can discard its in-memory board.
+    public func saveChecked(_ board: Board) throws {
+        guard !board.isClosed else { throw BoardError.notFound("board \(board.id) is closed") }
         pendingSaves.removeValue(forKey: board.id)?.cancel()
-        guard let data = Metrics.shared.span("save", "save.encode", detail: board.id, { try? Self.encoder.encode(board.snapshot) }) else { return }
-        Metrics.shared.span("save", "save.write", detail: board.id, bytes: data.count) { _ = try? data.write(to: url(for: board.id), options: .atomic) }
+        let data = try Metrics.shared.span("save", "save.encode", detail: board.id) { try Self.encoder.encode(board.snapshot) }
+        try Metrics.shared.span("save", "save.write", detail: board.id, bytes: data.count) { try data.write(to: url(for: board.id), options: .atomic) }
     }
 
     public func flush(_ boards: [Board]) {

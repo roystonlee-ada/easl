@@ -3,10 +3,10 @@
 package api
 
 // SchemaVersion is the `version` of the schema this build was generated from.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // SchemaHash is the first 16 hex digits of the SHA-256 of the schema file this build was generated from (client.attach `schema`).
-const SchemaHash = "45453de05d8d0532"
+const SchemaHash = "608eca66886347ba"
 
 // Error codes of a failed response's `error.code`, with what each means.
 const (
@@ -20,8 +20,10 @@ const (
 	CodeUnsupported = "unsupported"
 	// target exists but cannot act right now (e.g. a terminal tile without an attached surface), or the app is not running: no attached client (client.attach) serves the call, it didn't answer in time, or it disconnected before answering.
 	CodeUnavailable = "unavailable"
-	// agent.wait deadline passed before the agent reached a requested state.
+	// agent.wait or browser.wait deadline passed before the requested state.
 	CodeTimeout = "timeout"
+	// a browser page script failed.
+	CodeJsError = "js_error"
 	// unexpected server failure.
 	CodeInternal = "internal"
 	// an address (a terminal's name, `name@board`, a board's name, `board.open_remote`'s host name) matches more than one terminal, open board or host; the message lists each candidate (a terminal as `name@board (tile id)`, a host by its ssh target), so the caller can name one.
@@ -36,6 +38,26 @@ type ParamSpec struct {
 
 // Methods is each method's ParamSpec: what the server checks every request against, and names in its `invalid_params` errors.
 var Methods = map[string]ParamSpec{
+	"surface.stream": {
+		Accepted: []string{"id", "scale", "format"},
+		Required: []string{"id"},
+	},
+	"surface.ack": {
+		Accepted: []string{"stream", "frame"},
+		Required: []string{"stream", "frame"},
+	},
+	"surface.input": {
+		Accepted: []string{"stream", "events"},
+		Required: []string{"stream", "events"},
+	},
+	"surface.answer": {
+		Accepted: []string{"stream", "dialog", "accept", "text", "user", "password", "choice"},
+		Required: []string{"stream", "dialog", "accept"},
+	},
+	"surface.stop": {
+		Accepted: []string{"stream"},
+		Required: []string{"stream"},
+	},
 	"system.ping": {
 		Accepted: nil,
 		Required: nil,
@@ -44,9 +66,21 @@ var Methods = map[string]ParamSpec{
 		Accepted: []string{"reset", "watch"},
 		Required: nil,
 	},
+	"app.update": {
+		Accepted: []string{"mode"},
+		Required: []string{"mode"},
+	},
 	"board.get": {
-		Accepted: []string{"board", "since", "branch"},
+		Accepted: []string{"board", "viewer", "since", "branch"},
 		Required: nil,
+	},
+	"board.undo": {
+		Accepted: []string{"board", "viewer", "step"},
+		Required: []string{"viewer", "step"},
+	},
+	"board.redo": {
+		Accepted: []string{"board", "viewer", "step"},
+		Required: []string{"viewer", "step"},
 	},
 	"board.history": {
 		Accepted: []string{"board", "since", "limit", "kinds"},
@@ -64,6 +98,10 @@ var Methods = map[string]ParamSpec{
 		Accepted: []string{"host", "board", "select"},
 		Required: []string{"host", "board"},
 	},
+	"board.close": {
+		Accepted: []string{"board", "endSessions"},
+		Required: nil,
+	},
 	"board.export": {
 		Accepted: []string{"board", "path"},
 		Required: nil,
@@ -77,11 +115,11 @@ var Methods = map[string]ParamSpec{
 		Required: nil,
 	},
 	"object.create": {
-		Accepted: []string{"board", "type", "props", "frame", "size", "parent", "caller"},
+		Accepted: []string{"board", "type", "props", "frame", "size", "parent", "viewer", "step", "caller"},
 		Required: []string{"type", "props"},
 	},
 	"object.update": {
-		Accepted: []string{"id", "rev", "frame", "size", "props", "caller"},
+		Accepted: []string{"id", "rev", "frame", "z", "size", "props", "viewer", "step", "caller"},
 		Required: []string{"id"},
 	},
 	"object.upsert": {
@@ -89,7 +127,7 @@ var Methods = map[string]ParamSpec{
 		Required: []string{"key", "type", "props"},
 	},
 	"object.delete": {
-		Accepted: []string{"id", "caller"},
+		Accepted: []string{"id", "viewer", "step", "caller"},
 		Required: []string{"id"},
 	},
 	"object.measure": {
@@ -161,7 +199,7 @@ var Methods = map[string]ParamSpec{
 		Required: nil,
 	},
 	"agent.prompt": {
-		Accepted: []string{"target", "text", "mentions", "caller", "from", "when", "message", "force", "composer", "answer"},
+		Accepted: []string{"target", "text", "mentions", "staged", "viewer", "caller", "from", "when", "message", "force", "composer", "answer"},
 		Required: []string{"target", "text"},
 	},
 	"agent.wait": {
@@ -183,6 +221,10 @@ var Methods = map[string]ParamSpec{
 	"follow.report": {
 		Accepted: []string{"tile", "path", "range", "changes", "action"},
 		Required: []string{"tile", "path", "action"},
+	},
+	"view.seen": {
+		Accepted: []string{"id", "rev", "marker"},
+		Required: []string{"id"},
 	},
 	"view.attention": {
 		Accepted: []string{"id", "message", "clear", "caller"},
@@ -225,13 +267,128 @@ var Methods = map[string]ParamSpec{
 		Required: nil,
 	},
 	"client.attach": {
-		Accepted: []string{"version", "schema", "app", "host", "serves", "boards", "focused"},
+		Accepted: []string{"version", "schema", "app", "host", "identity", "serves", "boards", "focused"},
 		Required: []string{"version", "schema", "serves"},
+	},
+	"client.list": {
+		Accepted: nil,
+		Required: nil,
+	},
+	"browser.call": {
+		Accepted: []string{"id", "method", "params", "caller"},
+		Required: []string{"id", "method", "params"},
+	},
+	"browser.report": {
+		Accepted: []string{"id", "url", "pageTitle", "caller", "actor"},
+		Required: []string{"id"},
 	},
 	"text.measure": {
 		Accepted: []string{"items", "board"},
 		Required: []string{"items"},
 	},
+}
+
+// ViewerId: A remote window's in-memory identity, retained across reconnects and scoped to that window's edits and composer returns.
+type ViewerId = string
+
+type ComposerReceipt struct {
+	// Stable outcome identity; the same receipt appears live and in board.get so a viewer applies it once.
+	Receipt Id `json:"receipt"`
+	// One of "composer.returned", "composer.submitted".
+	Event    string   `json:"event"`
+	Viewer   ViewerId `json:"viewer"`
+	Terminal Id       `json:"terminal"`
+	// Original staged mention ids, never copied delivery ids or captured targets.
+	Ids []Id `json:"ids"`
+}
+
+type AttentionMarker struct {
+	ID       Id      `json:"id"`
+	Message  *string `json:"message,omitempty"`
+	RaisedBy *Id     `json:"raisedBy,omitempty"`
+	// The marker's identity for a guarded view.seen acknowledgment; echo the value from board.get or attention.changed.
+	RaisedAt string `json:"raisedAt"`
+}
+
+type ViewerReplay struct {
+	// The viewer's step that was replayed; omitted when no host history remains.
+	Step *int `json:"step,omitempty"`
+	// The replay created an opposite-stack step. The viewer uses this authoritative receipt even when repeating a command whose reply was lost.
+	Pushed bool `json:"pushed"`
+	// True when this non-live request's outcome receipt was retired. No changes are replayed; older live history is retained. Omitted otherwise.
+	Retired *bool          `json:"retired,omitempty"`
+	Changed []CanvasObject `json:"changed"`
+	Deleted []Id           `json:"deleted"`
+	// Objects with fields left unchanged because another edit replaced them.
+	Kept []Id `json:"kept"`
+}
+
+// SurfaceStream: A session owned only by the connection that opened it; never transferable between connections or reconnected clients.
+type SurfaceStream = string
+
+// SurfaceSize: Host WKWebView bounds in points, top-left origin. Input uses these points, not CSS pixels or encoded image pixels.
+type SurfaceSize struct {
+	W float64 `json:"w"`
+	H float64 `json:"h"`
+}
+
+// SurfaceInputEvent: Closed native-input union. Positive seq values increase strictly within each batch. Previously accepted seq values are ignored; callers never automatically resend input after reconnect. Raw mods are NSEvent modifier flags. Context menus are viewer-local.
+//
+// SurfaceInputEvent is a union of JSON objects (variants: "mouse", "scroll", "key", "text", "compose", "unmark", "focus", "command", "command", "navigate"); decode it as a generic map.
+type SurfaceInputEvent = map[string]any
+
+// SurfaceFrame: surface.frame data. Full current page image held in memory, never a profile, cookie jar, page source, dirty rectangle or image-less acknowledgement. Only the subscribed owning connection receives it.
+type SurfaceFrame struct {
+	Stream SurfaceStream `json:"stream"`
+	Seq    int           `json:"seq"`
+	// Conservative host app-queue watermark. Pending mouse/key processing checks hold it back until confirmed, and missing checks leave it unconfirmed. Direct text, scroll and commands have no WebKit processing check; this field does not guarantee their effects are visible in the image.
+	Input int         `json:"input"`
+	Size  SurfaceSize `json:"size"`
+	Scale float64     `json:"scale"`
+	// One of "jpeg", "png".
+	Format  string `json:"format"`
+	Data    string `json:"data"`
+	Width   int    `json:"width"`
+	Height  int    `json:"height"`
+	Back    bool   `json:"back"`
+	Forward bool   `json:"forward"`
+	Loading bool   `json:"loading"`
+}
+
+// SurfaceDialog: surface.dialog data, private to the subscribed owning connection. Completed once by surface.answer, safely dismissed when the connection or stream closes.
+type SurfaceDialog struct {
+	Stream SurfaceStream `json:"stream"`
+	Dialog string        `json:"dialog"`
+	// One of "alert", "confirm", "prompt", "login", "select".
+	Kind     string   `json:"kind"`
+	Origin   string   `json:"origin"`
+	Message  *string  `json:"message,omitempty"`
+	Text     *string  `json:"text,omitempty"`
+	Choices  []string `json:"choices,omitempty"`
+	Selected *int     `json:"selected,omitempty"`
+}
+
+// SurfaceNotice: surface.notice data, private to the subscribed owning connection. Downloads remain host files. File uploads are refused, not silently accepted.
+type SurfaceNotice struct {
+	Stream SurfaceStream `json:"stream"`
+	// One of "closed", "download", "refused".
+	Kind   string  `json:"kind"`
+	Reason *string `json:"reason,omitempty"`
+	Name   *string `json:"name,omitempty"`
+	State  *string `json:"state,omitempty"`
+}
+
+// SurfaceEvent: Private pushed events, never board broadcasts. Canonical board id and matching subscription are required on the owning connection.
+//
+// SurfaceEvent is a union of JSON objects (variants: "", "", ""); decode it as a generic map.
+type SurfaceEvent = map[string]any
+
+// BoardLifecycleEvent: Board availability after a successful registry transition. The envelope names the canonical board and data is empty. Closing does not disconnect subscriptions; reopening the board announces its availability on those same subscriptions.
+type BoardLifecycleEvent struct {
+	// One of "board.closed", "board.opened".
+	Event string         `json:"event"`
+	Board Id             `json:"board"`
+	Data  map[string]any `json:"data"`
 }
 
 // Id: Prefixed id, e.g. obj_01H…, men_…
@@ -337,13 +494,31 @@ type TerminalProps struct {
 	Branch *string `json:"branch,omitempty"`
 }
 
+type DrawingMachine struct {
+	// the drawing Mac's persistent client.attach identity, independent of its connection id and hostname
+	ID Id `json:"id"`
+	// the machine's display name, retained for offline notices; never used for routing
+	Host string `json:"host"`
+}
+
+// BrowserPropsURLIntent: Host-owned easld navigation intent, distinct from the observed url. An explicit string URL update stamps the assigned URL, resulting object rev and actor credited with that assignment; URL removal or non-string replacement clears it. Undo or rollback restoration of an existing browser whose URL or intent changed stamps the restored observed URL, new object rev and restored snapshot's updatedBy or createdBy actor, or clears the marker when the restored URL is absent or non-string. Browser reports and unrelated edits or restorations preserve the complete marker, including its original actor. Caller-supplied markers are discarded on creation/import and ignored on update. Mac-hosted boards do not consume this marker
+type BrowserPropsURLIntent struct {
+	URL   string `json:"url"`
+	Rev   int    `json:"rev"`
+	Actor Actor  `json:"actor"`
+}
+
 type BrowserProps struct {
 	URL string `json:"url"`
+	// Host-owned easld navigation intent, distinct from the observed url. An explicit string URL update stamps the assigned URL, resulting object rev and actor credited with that assignment; URL removal or non-string replacement clears it. Undo or rollback restoration of an existing browser whose URL or intent changed stamps the restored observed URL, new object rev and restored snapshot's updatedBy or createdBy actor, or clears the marker when the restored URL is absent or non-string. Browser reports and unrelated edits or restorations preserve the complete marker, including its original actor. Caller-supplied markers are discarded on creation/import and ignored on update. Mac-hosted boards do not consume this marker
+	URLIntent *BrowserPropsURLIntent `json:"urlIntent,omitempty"`
 	// names the tile; the app never overwrites it
 	Title *string `json:"title,omitempty"`
 	// written by the app: the page's own title; shown when `title` is unset; never bumps rev
 	PageTitle *string `json:"pageTitle,omitempty"`
-	Zoom      *Zoom   `json:"zoom,omitempty"`
+	// the Mac that runs this page in its own browser profile. Mac-hosted boards run on their host and reject foreign or cleared assignments until machine switching is supported; imported browsers bind to the host. Easld persists the creating Mac's identity, or the first eligible attached Mac for an existing unassigned tile. Disconnect never moves a page to another machine
+	DrawingMachine *DrawingMachine `json:"drawingMachine,omitempty"`
+	Zoom           *Zoom           `json:"zoom,omitempty"`
 	// a named browser profile: its own cookies, logins and storage, shared by every tile that names it; absent: the default profile. Tiles a page opens (links, popups) take it
 	Profile *string `json:"profile,omitempty"`
 	// a page served from this Mac (localhost, 127.x, [::1], a .localhost name, a file) reloads when a file under the board root (a file page: its folder) changes; hidden files and folders and node_modules don't count
@@ -582,7 +757,7 @@ type QuestionPropsAnswer struct {
 	By Actor `json:"by,omitempty"`
 }
 
-// QuestionProps: A question an agent (or a script elsewhere) asks the user on the board instead of in chat; the user answers it on its tile (`easl ask` is the CLI for it). Lifecycle: status open → answered | cancelled | expired, each final; a closed question takes only `archived` (and key, zoom). Validated on create and update (invalid_params names the rule): option ids unique, `recommended` and `answer.option` name an option, `answer` exactly when answered. A new question without a frame is sized from its props: 460 wide, 194 + 50 per option (+ 30 with context) tall while open; closing it shrinks it to 148 (+ 40 with a note). Open questions are on the user's ⌘J needs-you list and the board's open-asks count. Answered, it reaches the asker as an object.updated event and, when `asker.tile` is a terminal on the board, as a mention of the question with that terminal's next prompt (never typed into it). An open question past `expiresAt` becomes expired (by easl, no undo step)
+// QuestionProps: A question an agent (or a script elsewhere) asks the user on the board instead of in chat; the user answers it on its tile (`easl ask` is the CLI for it). Lifecycle: status open → answered | cancelled | expired, each final; a closed question takes only `archived`, `keep`, and `archiveAfter` (and key, zoom). Validated on create and update (invalid_params names the rule): option ids unique, `recommended` and `answer.option` name an option, `answer` exactly when answered. A new question without a frame is sized from its props: 460 wide, 194 + 50 per option (+ 30 with context) tall while open; closing it shrinks it to 148 (+ 40 with a note). Open questions are on the user's ⌘J needs-you list and the board's open-asks count. Answered, it reaches the asker as an object.updated event and, when `asker.tile` is a terminal on the board, as a mention of the question with that terminal's next prompt (never typed into it). An open question past `expiresAt` becomes expired (by easl, no undo step). A closed question that is not kept is archived by the host `archiveAfter` seconds after its `updatedAt` (default 10, at most 86400), on the same timer as expiry, as the app's own write (object.updated, persisted, no undo step). `keep: true` exempts that, not expiry or an explicit archive. null removes `keep` or `archiveAfter` and restores the default. Moving, zooming, changing retention, or unarchiving restarts the delay from the new `updatedAt`.
 type QuestionProps struct {
 	Question string `json:"question"`
 	// what the user picks from (number keys 1–9 pick on the tile); may be empty, then the answer is a note
@@ -599,10 +774,14 @@ type QuestionProps struct {
 	ExpiresAt *string `json:"expiresAt,omitempty"`
 	// with status answered only: the picked option and/or a note (at least one); `at` and `by` are written by easl when the question becomes answered
 	Answer *QuestionPropsAnswer `json:"answer,omitempty"`
-	// true hides a closed question's tile (archive is not a status: `status` keeps how it ended, `answer` stays); an open question can't be archived
-	Archived *bool      `json:"archived,omitempty"`
-	Zoom     *Zoom      `json:"zoom,omitempty"`
-	Key      *ObjectKey `json:"key,omitempty"`
+	// true hides a closed question's tile (archive is not a status: `status` keeps how it ended, `answer` stays); an open question can't be archived. The host also sets it when a closed question's archive delay elapses
+	Archived *bool `json:"archived,omitempty"`
+	// true exempts a closed question from automatic archiving; it does not stop expiry or an explicit archive. Absent or false is not exempt. May change after closure; null removes it
+	Keep *bool `json:"keep,omitempty"`
+	// seconds after updatedAt before a closed, unkept question is archived. The implicit delay is 10 for stored questions without a readable value. On create, an absent or null value uses the host's questionArchiveAfter app setting or easld --question-archive-after default; a nondefault host delay is stored in this prop. An explicit value wins. A fraction is a fraction of a second. May change after closure; null then restores the implicit 10
+	ArchiveAfter *float64   `json:"archiveAfter,omitempty"`
+	Zoom         *Zoom      `json:"zoom,omitempty"`
+	Key          *ObjectKey `json:"key,omitempty"`
 }
 
 type ShapeProps struct {
@@ -795,10 +974,11 @@ type PageLog struct {
 type MentionTarget = map[string]any
 
 type Mention struct {
-	ID       Id            `json:"id"`
-	Target   MentionTarget `json:"target"`
-	Label    string        `json:"label"`
-	StagedAt string        `json:"stagedAt"`
+	ID     Id            `json:"id"`
+	Target MentionTarget `json:"target"`
+	Label  string        `json:"label"`
+	// Staging time: API seconds since 2001-01-01 or an RFC 3339 timestamp.
+	StagedAt any `json:"stagedAt"`
 	// target changed since staging
 	Edited bool `json:"edited"`
 }
