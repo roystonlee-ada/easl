@@ -98,6 +98,6 @@ private enum TerminalPixels {
         let expected = "  ROW_0\n  ROW_1\n  ROW_2\n  ROW_3\n  ROW_4\n  ROW_5\n  ROW_6\n  ROW_7\n> ROW_8\n  ROW_9\n  ROW_10\n  ROW_11"
         require(target == .terminal(object: object.id, text: expected, part: .rows), "a click just above row 9 mentioned the wrong rows: \(String(describing: target))")
         if failures > 0 { exit(1) }
-        print("PASS flipped and magnified window geometry, unchanged model and session size, underline alignment, and row-boundary mention")
+        print("PASS flipped and magnified window geometry, unchanged tile frame and terminal view size, underline alignment, and row-boundary mention")
     }
 }
