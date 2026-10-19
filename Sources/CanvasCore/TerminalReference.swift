@@ -467,7 +467,7 @@ extension Board {
         let file = URL(fileURLWithPath: path).standardizedFileURL
         let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.resolvingSymlinksInPath()
-        let directories = resolvedRoot == home ? tempDirectories : [resolvedRoot.path] + tempDirectories
+        let directories = resolvedRoot.path == home.path ? tempDirectories : [resolvedRoot.path] + tempDirectories
         guard let resolved = LocalImage.confined(file, directories: directories),
               !file.pathComponents.contains("node_modules"),
               !resolved.pathComponents.contains("node_modules") else { return nil }

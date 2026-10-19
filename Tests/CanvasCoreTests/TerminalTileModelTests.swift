@@ -262,12 +262,15 @@ struct TerminalBoardTests {
         }
         let report = root.appendingPathComponent("out/report.html").path
         try "<h1>Report</h1>".write(toFile: report, atomically: true, encoding: .utf8)
+        let htm = root.appendingPathComponent("out/old.HTM")
+        let chart = scratch.appendingPathComponent("chart.html")
+        for file in [htm, chart] { try "<p>Page</p>".write(to: file, atomically: true, encoding: .utf8) }
         let alias = elsewhere.appendingPathComponent("alias.html")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: URL(fileURLWithPath: report))
         #expect(page(alias.path) == URL(fileURLWithPath: report).resolvingSymlinksInPath())
         #expect(page(report) == URL(fileURLWithPath: report).resolvingSymlinksInPath())
-        #expect(page(root.appendingPathComponent("out/./old.HTM").path) == root.appendingPathComponent("out/old.HTM").resolvingSymlinksInPath(), ".htm too, standardized")
-        #expect(page(scratch.appendingPathComponent("chart.html").path) != nil, "a temp directory")
+        #expect(page(root.appendingPathComponent("out/./old.HTM").path) == htm.resolvingSymlinksInPath(), ".htm too, standardized")
+        #expect(page(chart.path) == chart.resolvingSymlinksInPath(), "a temp directory outside the root")
         #expect(page(report, lines: LineRange(start: 12, end: 12)) == nil, "a line: its source")
         #expect(page(report, newTile: true) == nil, "⌥⌘- or ⇧⌘-click: its source")
         #expect(page(report, hosted: true) == nil, "a hosted terminal's path is its host's file")
@@ -296,7 +299,7 @@ struct TerminalBoardTests {
 
     @Test func aHomeRootedBoardRendersOnlyTemporaryPages() {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let board = Board(id: "brd_home_page", root: home)
+        let board = Board(id: "brd_home_page", root: URL(fileURLWithPath: home.path, isDirectory: false))
         let scratch = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("page-tests")
         func page(_ file: URL) -> URL? {
             board.referencePage(path: file.path, lines: nil, newTile: false, hosted: false, tempDirectories: [scratch.path])
