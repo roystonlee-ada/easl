@@ -1536,6 +1536,7 @@ final class CanvasWindow: NSWindow {
         if ended.pan.panning { NSCursor.pop() }
     }
 }
+
 extension ScrollGesture.Step {
     init?(_ event: NSEvent) {
         switch (event.phase, event.momentumPhase) {

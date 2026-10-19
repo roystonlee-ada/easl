@@ -61,7 +61,8 @@ public struct ScrollGesture: Sendable {
 
     public init() {}
 
-    /// The window increments `sequence` at each gesture start, including starts outside this tile.
+    /// Returns nil until the gesture moves. `tileTakes` says whether the tile accepts its first movement.
+    /// The window increments `sequence` at each gesture start and phaseless step, even outside this tile.
     public mutating func owner(of step: Step, sequence: UInt64, dx: CGFloat, dy: CGFloat, tileTakes: Bool) -> Owner? {
         if self.sequence != sequence {
             self.sequence = sequence
