@@ -127,6 +127,22 @@ final class BrowserTile: NSView, TileContent {
     private var pageWatch: (directory: URL, watch: LocalPageWatch)?
     /// A counted file change arrived while the page loaded: it reloads once that load ends.
     private var reloadPending = false
+    private struct FileVersion {
+        let url: URL
+        let modified: Date
+
+        init?(_ url: URL?) {
+            guard let url, url.isFileURL else { return nil }
+            let file = URL(fileURLWithPath: url.path)
+            guard let modified = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else { return nil }
+            self.url = file
+            self.modified = modified
+        }
+    }
+    /// Sample before WebKit reads the document, not after its slow resources finish.
+    private var requestedFileVersion: FileVersion?
+    private var loadedFileVersion: FileVersion?
+    private var fileRefreshPending: URL?
 
     init(object: CanvasObject, board: Board) {
         self.board = board
@@ -320,6 +336,10 @@ final class BrowserTile: NSView, TileContent {
             guard let self, message.frameInfo.isMainFrame else { return }
             self.surface?.selectRequested(message.body, origin: Self.host(of: message.frameInfo.securityOrigin))
         }, contentWorld: BrowserScripts.world, name: BrowserScripts.selectMessageName)
+        controller.add(PageMessages { [weak self] message in
+            guard let self, message.frameInfo.isMainFrame, let webView = message.webView else { return }
+            self.surface?.uploadRequested(message.body, in: webView, origin: Self.host(of: message.frameInfo.securityOrigin))
+        }, contentWorld: BrowserScripts.world, name: BrowserScripts.fileMessageName)
         // The page's console, errors and requests from its first line on (`PageLog`).
         controller.addUserScript(WKUserScript(source: PageCapture.source, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: .page))
         controller.add(PageMessages { [weak self] message in
@@ -365,8 +385,16 @@ final class BrowserTile: NSView, TileContent {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.chrome.isLoading = view.isLoading
-                    if !view.isLoading { self.commitURL() }
-                    if !view.isLoading, self.reloadPending { self.filesChanged() }
+                    if !view.isLoading {
+                        self.commitURL()
+                        if self.reloadPending {
+                            self.fileRefreshPending = nil
+                            self.filesChanged()
+                        } else if let pending = self.fileRefreshPending {
+                            self.fileRefreshPending = nil
+                            if pending == self.loadedFileVersion?.url { self.reloadIfFileChanged() }
+                        }
+                    }
                     self.signalChange()
                     BrowserExtensions.changed(self, .loading)
                 }
@@ -473,7 +501,7 @@ final class BrowserTile: NSView, TileContent {
     private func setPageActivity(_ on: Bool) {
         guard let webView, on != pageActivity else { return }
         pageActivity = on
-        Task { _ = try? await webView.callAsyncJavaScript(BrowserScripts.ensure + "return window.__canvasCmux.setActivity(on)", arguments: ["on": on], in: nil, contentWorld: BrowserScripts.world) }
+        PageScript.call(BrowserScripts.ensure + "return window.__canvasCmux.setActivity(on)", ["on": on], in: BrowserScripts.world, on: webView)
     }
 
     /// Drops the web view (its page, history, and web content process share) but keeps the image
@@ -514,6 +542,9 @@ final class BrowserTile: NSView, TileContent {
         self.webView = nil
         pageWatch = nil
         reloadPending = false
+        requestedFileVersion = nil
+        loadedFileVersion = nil
+        fileRefreshPending = nil
         closeFind()
         pendingNavigations = []
         uncommittedNavigations = []
@@ -1151,6 +1182,15 @@ final class BrowserTile: NSView, TileContent {
         track(webView.reload())
     }
 
+    func reloadIfFileChanged() {
+        guard let webView, let current = FileVersion(webView.url) else { return }
+        guard !webView.isLoading else { return fileRefreshPending = current.url }
+        guard let loaded = loadedFileVersion, current.url == loaded.url, current.modified != loaded.modified else { return }
+        NSLog("easl: browser %@ reloading: %@ changed since it loaded", objectID, current.url.path)
+        credit.user()
+        track(webView.reload())
+    }
+
     // MARK: Print, find
 
     var canPrint: Bool { webView?.url != nil && window != nil }
@@ -1284,6 +1324,10 @@ extension BrowserTile: WKNavigationDelegate, WKUIDelegate {
             if navigationAction.targetFrame?.isMainFrame != false { openInOtherApp(url, from: navigationAction.sourceFrame) }
             if NSWorkspace.shared.urlForApplication(toOpen: url) != nil { return decisionHandler(.cancel) }
         }
+        if navigationAction.targetFrame?.isMainFrame == true, !navigationAction.shouldPerformDownload {
+            requestedFileVersion = FileVersion(url)
+            if fileRefreshPending != requestedFileVersion?.url { fileRefreshPending = nil }
+        }
         decisionHandler(navigationAction.shouldPerformDownload ? .download : .allow)
     }
 
@@ -1317,6 +1361,7 @@ extension BrowserTile: WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         uncommittedNavigations.removeAll { $0 === navigation }
+        loadedFileVersion = requestedFileVersion
         clearLoadFailure()
         commitURL()
         // The committed document's own HTTP error, or none; a page back from the back/forward
@@ -1701,7 +1746,7 @@ extension BrowserTile {
 
     /// `webView`'s page log, its own document's HTTP error (`failure`) first.
     fileprivate static func pageLog(of webView: WKWebView, failure: PageLogEntry?) async -> PageLog? {
-        guard let text = try? await webView.callAsyncJavaScript(PageCapture.readScript, arguments: [:], in: nil, contentWorld: .page) as? String,
+        guard let text = await PageScript.value(PageCapture.readScript, in: .page, on: webView, { $0 as? String }),
               let json = try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)), var log = PageLog(json: json) else { return nil }
         if let failure { log.add(documentFailure: failure) }
         return log

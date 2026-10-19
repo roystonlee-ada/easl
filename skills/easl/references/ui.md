@@ -19,6 +19,8 @@ Point the user at Help › easl Basics (⌥⌘/) for the same text in the app.
 ## Reading a board
 
 - Scroll pans, pinch zooms; ⌘9 shows everything, ⌘0 is 100%.
+  Code and changes tiles scroll vertically when their content overflows; sideways scrolls pan the board.
+  Over terminals, vertical scrolling stays with the tile, focused or not. Click into a full-screen program that does not read the mouse to scroll it. Sideways scrolls pan the board.
   With a mouse: the wheel pans, ⌘-scroll zooms around the pointer, ⇧-scroll pans sideways; drag with the middle button to pan from anywhere, tiles included.
 - **Groups** are tinted, titled regions of tiles that belong together; an **arrow**'s label says how two things relate, and one into a code tile points at its lines.
   A code tile's **caption** (the line under its header) says why those lines matter. A code tile keeps its range on its code as lines move above or inside it; "⚠︎ stale: …" in its header means that code is gone (the range is left untinted).
@@ -81,7 +83,8 @@ Point the user at Help › easl Basics (⌥⌘/) for the same text in the app.
   The title bar shows `−  150%  +` left of the ✕: the % whenever it isn't 100% (a click resets it), − and + on hover or selection. Corner drag resizes; ⌥-drag resizes keeping proportions. A zoomed-in tile stays live further out.
 - ⌘P Go to (tiles, files, `@symbols`, and while typing a note's headings; `core.py:120` opens at a line; ⌘P again selects the query, Esc closes; an agent's terminal is framed with its follow tile when both fit); ⌘T new terminal; ⌘W close the selection (a terminal asks first; Close is ⌘⌫); ⌘G group; ⌘F find in a code tile; ⌥⌘-arrows step (see Reading a board).
 - Right-click empty board for New Terminal Here, New Note Here and New Browser Here; File › New … puts them in the view.
-- ⌘-click a `path:line` in terminal output opens it in that terminal's preview tile; ⌥⌘-click opens a separate tile the user keeps.
+- ⌘-click a `path:line` in terminal output opens it in that terminal's preview tile; ⌥⌘-click opens a separate tile the user keeps. An `.html` or `.htm` file in the board root or a temp directory, named without a line, opens rendered in a browser tile beside the terminal (one already showing it is gone to, reloaded if the file changed); ⌥⌘- or ⇧⌘-click, a line, a file elsewhere or a hosted terminal opens its source.
+  On a home-folder board, only temp-directory pages render. `node_modules` pages open as source. A repeated click checks only the HTML file, not adjacent assets; a click during loading checks again when loading ends.
 - Return enters the selected tile (a terminal, a code tile's rows, a changes tile, a note, a page, a question); Esc gives the keyboard back to the board.
   In a terminal or a web page Esc belongs to the program or page: ⌘Esc (View › Leave Tile) leaves any tile.
 - Code › Go to Definition ⌃⌘J (Open Definition in New Tile ⌃⌥⌘J), Find References ⌃⌘R (Open All lays them out as excerpts), Outline ⌃⌘O (type to filter), and code tiles' hover use the language's server (sourcekit-lsp, pyright-langserver, typescript-language-server, gopls, rust-analyzer), found through the login shell: `EASL_LSP_<LANGUAGE>` (e.g. `EASL_LSP_RUST`) if set, else PATH, else nvim's mason bin, `~/go/bin`, `rustup which rust-analyzer`; without one they answer by text search, labelled so, and the panel says where easl looked.
