@@ -544,13 +544,13 @@ final class CanvasTerminalView: TerminalView {
         if let step = ScrollGesture.Step(event) {
             // A gesture's first event without movement stays here: the canvas mustn't start
             // tracking a gesture that may turn out to be the terminal's.
-            owner = gesture.owner(of: step, dx: dx, dy: dy, tileTakes: !sideways) ?? .tile
+            owner = gesture.owner(of: step, sequence: (window as? CanvasWindow)?.scrollSequence ?? 0, dx: dx, dy: dy, tileTakes: !sideways) ?? .tile
         }
         if owner == .canvas {
             nextResponder?.scrollWheel(with: event)
             return
         }
-        guard window?.firstResponder === self || isMouseCaptured || hasScrollback?() == true else { return }
+        guard window?.firstResponder === self || hasScrollback?() == true || isMouseCaptured else { return }
         super.scrollWheel(with: event)
     }
 

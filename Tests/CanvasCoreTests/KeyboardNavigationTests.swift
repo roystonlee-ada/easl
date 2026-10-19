@@ -53,41 +53,56 @@ struct KeyboardNavigationTests {
 
     @Test func aScrollGestureKeepsTheOwnerItsFirstMovementChose() {
         var gesture = ScrollGesture()
-        #expect(gesture.owner(of: .began, dx: 0, dy: 0, tileTakes: true) == nil, "nothing decided before it moves")
-        #expect(gesture.owner(of: .changed, dx: 0, dy: -6, tileTakes: true) == .tile)
-        #expect(gesture.owner(of: .changed, dx: 30, dy: 0, tileTakes: false) == .tile, "a later sideways step stays with the tile")
-        #expect(gesture.owner(of: .ended, dx: 0, dy: 0, tileTakes: true) == .tile)
-        #expect(gesture.owner(of: .momentumBegan, dx: 0, dy: -4, tileTakes: true) == .tile, "momentum keeps its owner")
-        #expect(gesture.owner(of: .momentumChanged, dx: 0, dy: -2, tileTakes: false) == .tile)
-        #expect(gesture.owner(of: .momentumEnded, dx: 0, dy: 0, tileTakes: false) == .tile)
+        #expect(gesture.owner(of: .began, sequence: 1, dx: 0, dy: 0, tileTakes: true) == nil)
+        #expect(gesture.owner(of: .changed, sequence: 1, dx: 0, dy: -6, tileTakes: true) == .tile)
+        #expect(gesture.owner(of: .changed, sequence: 1, dx: 30, dy: 0, tileTakes: false) == .tile)
+        #expect(gesture.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true) == .tile)
+        #expect(gesture.owner(of: .momentumBegan, sequence: 1, dx: 0, dy: -4, tileTakes: true) == .tile)
+        #expect(gesture.owner(of: .momentumChanged, sequence: 1, dx: 0, dy: -2, tileTakes: false) == .tile)
+        #expect(gesture.owner(of: .momentumEnded, sequence: 1, dx: 0, dy: 0, tileTakes: false) == .tile)
 
-        #expect(gesture.owner(of: .began, dx: 0, dy: 0, tileTakes: true) == nil, "a new gesture starts undecided")
-        #expect(gesture.owner(of: .changed, dx: 0, dy: 0, tileTakes: false) == nil, "a step without movement decides nothing")
-        #expect(gesture.owner(of: .changed, dx: 12, dy: 1, tileTakes: false) == .canvas)
-        #expect(gesture.owner(of: .changed, dx: 0, dy: 9, tileTakes: true) == .canvas, "the canvas keeps it too")
-        #expect(gesture.owner(of: .ended, dx: 0, dy: 0, tileTakes: true) == .canvas)
-        #expect(gesture.owner(of: .momentumBegan, dx: 3, dy: 0, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .began, sequence: 2, dx: 0, dy: 0, tileTakes: true) == nil)
+        #expect(gesture.owner(of: .changed, sequence: 2, dx: 0, dy: 0, tileTakes: false) == nil)
+        #expect(gesture.owner(of: .changed, sequence: 2, dx: 12, dy: 1, tileTakes: false) == .canvas)
+        #expect(gesture.owner(of: .changed, sequence: 2, dx: 0, dy: 9, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .ended, sequence: 2, dx: 0, dy: 0, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .momentumBegan, sequence: 2, dx: 3, dy: 0, tileTakes: true) == .canvas)
     }
 
     @Test func aScrollGestureTheTileDidNotSeeBeginIsTheCanvas() {
         var gesture = ScrollGesture()
-        _ = gesture.owner(of: .began, dx: 0, dy: 0, tileTakes: true)
-        _ = gesture.owner(of: .changed, dx: 0, dy: -6, tileTakes: true)
-        _ = gesture.owner(of: .ended, dx: 0, dy: 0, tileTakes: true)
-        // A pan that began on empty board slides the tile under the pointer.
-        #expect(gesture.owner(of: .changed, dx: 0, dy: -8, tileTakes: true) == .canvas, "a first .changed with no began is the canvas's")
-        #expect(gesture.owner(of: .changed, dx: 0, dy: -8, tileTakes: true) == .canvas)
-        #expect(gesture.owner(of: .ended, dx: 0, dy: 0, tileTakes: true) == .canvas)
-        #expect(gesture.owner(of: .momentumBegan, dx: 0, dy: -5, tileTakes: true) == .canvas)
+        _ = gesture.owner(of: .began, sequence: 1, dx: 0, dy: -6, tileTakes: true)
+        _ = gesture.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true)
+        #expect(gesture.owner(of: .changed, sequence: 2, dx: 0, dy: -8, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .ended, sequence: 2, dx: 0, dy: 0, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .momentumBegan, sequence: 2, dx: 0, dy: -5, tileTakes: true) == .canvas)
 
         var fresh = ScrollGesture()
-        #expect(fresh.owner(of: .changed, dx: 0, dy: 0, tileTakes: true) == .canvas, "even without movement")
+        #expect(fresh.owner(of: .changed, sequence: 1, dx: 0, dy: 0, tileTakes: true) == .canvas)
         var momentum = ScrollGesture()
-        _ = momentum.owner(of: .began, dx: 0, dy: 0, tileTakes: true)
-        _ = momentum.owner(of: .changed, dx: 0, dy: -6, tileTakes: true)
-        _ = momentum.owner(of: .ended, dx: 0, dy: 0, tileTakes: true)
-        #expect(momentum.owner(of: .momentumChanged, dx: 0, dy: -3, tileTakes: true) == .canvas, "another gesture's momentum sliding the tile under")
-        #expect(momentum.owner(of: .began, dx: 0, dy: 0, tileTakes: true) == nil, "began resets the owner")
+        _ = momentum.owner(of: .began, sequence: 1, dx: 0, dy: -6, tileTakes: true)
+        _ = momentum.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true)
+        #expect(momentum.owner(of: .momentumChanged, sequence: 2, dx: 0, dy: -3, tileTakes: true) == .canvas)
+        #expect(momentum.owner(of: .began, sequence: 3, dx: 0, dy: 0, tileTakes: true) == nil)
+    }
+
+    @Test func missedGestureBoundariesCannotReuseTheTilesOwner() {
+        var gesture = ScrollGesture()
+        _ = gesture.owner(of: .began, sequence: 1, dx: 0, dy: -6, tileTakes: true)
+        #expect(gesture.owner(of: .changed, sequence: 2, dx: 0, dy: -8, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .momentumBegan, sequence: 2, dx: 0, dy: -4, tileTakes: true) == .canvas)
+
+        var momentum = ScrollGesture()
+        _ = momentum.owner(of: .began, sequence: 1, dx: 0, dy: -6, tileTakes: true)
+        _ = momentum.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true)
+        #expect(momentum.owner(of: .momentumBegan, sequence: 2, dx: 0, dy: -4, tileTakes: true) == .canvas)
+    }
+
+    @Test func endingWithoutAnOwnerCannotClaimUnrelatedMomentum() {
+        var gesture = ScrollGesture()
+        _ = gesture.owner(of: .began, sequence: 1, dx: 0, dy: 0, tileTakes: true)
+        #expect(gesture.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true) == nil)
+        #expect(gesture.owner(of: .momentumBegan, sequence: 1, dx: 0, dy: -4, tileTakes: true) == .canvas)
     }
 
     @Test func aMiddleDragPansWithThePointerOnceItMoves() {

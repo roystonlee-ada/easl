@@ -639,18 +639,17 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     // MARK: Mouse
 
     override func scrollWheel(with event: NSEvent) {
-        var dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
-        if !event.hasPreciseScrollingDeltas {
-            dx *= CodeMetrics.rowHeight
-            dy *= CodeMetrics.rowHeight
-        }
+        let dx = event.scrollingDeltaX
+        var dy = event.scrollingDeltaY
+        let sideways = CanvasWheel.sideways(dx: dx, dy: dy, precise: event.hasPreciseScrollingDeltas, shift: event.modifierFlags.contains(.shift))
+        if !event.hasPreciseScrollingDeltas { dy *= CodeMetrics.rowHeight }
         let scrollable = contentHeight > viewportHeight + 0.5
         guard let step = ScrollGesture.Step(event) else {
             // A mouse wheel notch or a replayed step: each one on its own.
-            guard scrollable, abs(dy) >= abs(dx), dy != 0 else { return super.scrollWheel(with: event) }
+            guard scrollable, !sideways, dy != 0 else { return super.scrollWheel(with: event) }
             return setScroll(scroll - dy)
         }
-        switch gesture.owner(of: step, dx: dx, dy: dy, tileTakes: scrollable && abs(dy) >= abs(dx)) {
+        switch gesture.owner(of: step, sequence: (window as? CanvasWindow)?.scrollSequence ?? 0, dx: dx, dy: dy, tileTakes: scrollable && !sideways) {
         case .tile?:
             if dy != 0 { setScroll(scroll - dy) }
         case .canvas?:

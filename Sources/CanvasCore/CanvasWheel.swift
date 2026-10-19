@@ -55,22 +55,26 @@ public struct ScrollGesture: Sendable {
         case began, changed, ended, momentumBegan, momentumChanged, momentumEnded
     }
 
-    public private(set) var owner: Owner?
-    /// The last step seen: what the next event must be to continue the same gesture.
+    private var owner: Owner?
     private var last: Step?
+    private var sequence: UInt64?
 
     public init() {}
 
-    /// The owner of a gesture event at `step` that moved by (`dx`, `dy`); `tileTakes`: the tile
-    /// scrolls a first movement like this one. Nil while the gesture hasn't moved yet.
-    public mutating func owner(of step: Step, dx: CGFloat, dy: CGFloat, tileTakes: Bool) -> Owner? {
+    /// The window increments `sequence` at each gesture start, including starts outside this tile.
+    public mutating func owner(of step: Step, sequence: UInt64, dx: CGFloat, dy: CGFloat, tileTakes: Bool) -> Owner? {
+        if self.sequence != sequence {
+            self.sequence = sequence
+            owner = nil
+            last = nil
+        }
         if step == .began {
             owner = nil
         } else if !continues(step) {
             owner = .canvas
         }
-        last = step
         if owner == nil, dx != 0 || dy != 0 { owner = tileTakes ? .tile : .canvas }
+        last = step == .ended && owner == nil ? nil : step
         return owner
     }
 

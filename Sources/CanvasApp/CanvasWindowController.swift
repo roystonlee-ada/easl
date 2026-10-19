@@ -1438,6 +1438,7 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate, NSMenu
 final class CanvasWindow: NSWindow {
     /// A middle-button press on the canvas, and the press itself to hand on if it ends a click.
     private var middlePan: (pan: CanvasDragPan, press: NSEvent)?
+    private(set) var scrollSequence: UInt64 = 0
 
     override init(contentRect: NSRect, styleMask style: NSWindow.StyleMask, backing backingStoreType: NSWindow.BackingStoreType, defer flag: Bool) {
         super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
@@ -1465,7 +1466,11 @@ final class CanvasWindow: NSWindow {
     /// (`middleDragPans`). Every event monitor has seen the event by now.
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown, let controller = windowController as? CanvasWindowController { controller.keyTyped(event) }
-        if event.type == .scrollWheel, zoomsCanvas(event, at: event.locationInWindow) { return }
+        if event.type == .scrollWheel {
+            let step = ScrollGesture.Step(event)
+            if step == .began || step == nil { scrollSequence &+= 1 }
+            if zoomsCanvas(event, at: event.locationInWindow) { return }
+        }
         if middleDragPans(event) { return }
         super.sendEvent(event)
     }
@@ -1553,5 +1558,20 @@ private final class TabDot: NSView {
     override func draw(_ dirtyRect: NSRect) {
         color.setFill()
         NSBezierPath(ovalIn: NSRect(x: (bounds.width - diameter) / 2, y: (bounds.height - diameter) / 2, width: diameter, height: diameter)).fill()
+    }
+}
+extension ScrollGesture.Step {
+    /// Where `event` sits in a trackpad gesture; nil for a scroll outside one (a wheel notch, a
+    /// replayed step).
+    init?(_ event: NSEvent) {
+        switch (event.phase, event.momentumPhase) {
+        case let (phase, _) where phase.contains(.began) || phase.contains(.mayBegin): self = .began
+        case let (phase, _) where phase.contains(.ended) || phase.contains(.cancelled): self = .ended
+        case let (phase, _) where !phase.isEmpty: self = .changed
+        case let (_, momentum) where momentum.contains(.began): self = .momentumBegan
+        case let (_, momentum) where momentum.contains(.ended) || momentum.contains(.cancelled): self = .momentumEnded
+        case let (_, momentum) where !momentum.isEmpty: self = .momentumChanged
+        default: return nil
+        }
     }
 }
