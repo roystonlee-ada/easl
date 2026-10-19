@@ -72,17 +72,17 @@ struct KeyboardNavigationTests {
         var gesture = ScrollGesture()
         _ = gesture.owner(of: .began, sequence: 1, dx: 0, dy: -6, tileTakes: true)
         _ = gesture.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true)
-        #expect(gesture.owner(of: .changed, sequence: 2, dx: 0, dy: -8, tileTakes: true) == .canvas)
-        #expect(gesture.owner(of: .ended, sequence: 2, dx: 0, dy: 0, tileTakes: true) == .canvas)
-        #expect(gesture.owner(of: .momentumBegan, sequence: 2, dx: 0, dy: -5, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .changed, sequence: 1, dx: 0, dy: -8, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true) == .canvas)
+        #expect(gesture.owner(of: .momentumBegan, sequence: 1, dx: 0, dy: -5, tileTakes: true) == .canvas)
 
         var fresh = ScrollGesture()
         #expect(fresh.owner(of: .changed, sequence: 1, dx: 0, dy: 0, tileTakes: true) == .canvas)
         var momentum = ScrollGesture()
         _ = momentum.owner(of: .began, sequence: 1, dx: 0, dy: -6, tileTakes: true)
         _ = momentum.owner(of: .ended, sequence: 1, dx: 0, dy: 0, tileTakes: true)
-        #expect(momentum.owner(of: .momentumChanged, sequence: 2, dx: 0, dy: -3, tileTakes: true) == .canvas)
-        #expect(momentum.owner(of: .began, sequence: 3, dx: 0, dy: 0, tileTakes: true) == nil)
+        #expect(momentum.owner(of: .momentumChanged, sequence: 1, dx: 0, dy: -3, tileTakes: true) == .canvas)
+        #expect(momentum.owner(of: .began, sequence: 2, dx: 0, dy: 0, tileTakes: true) == nil)
     }
 
     @Test func missedGestureBoundariesCannotReuseTheTilesOwner() {
