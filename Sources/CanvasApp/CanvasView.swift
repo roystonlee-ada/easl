@@ -13,7 +13,7 @@ final class CanvasDocumentView: NSView {
     // nonisolated: AppKit asks on every coordinate transform, and the @objc thunk of a main-actor
     // override otherwise pays a runtime executor check each time.
     nonisolated override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
+    override var acceptsFirstResponder: Bool { canvas?.remote?.mirror.availability != .closed }
     /// Canvas gestures work on the first click into an inactive window, like any canvas app.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -74,6 +74,7 @@ final class CanvasDocumentView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? { canvas?.emptyCanvasMenu(at: convert(event.locationInWindow, from: nil)) }
 
     override func keyDown(with event: NSEvent) {
+        guard canvas?.remote?.mirror.availability != .closed else { return }
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let plain = modifiers.isEmpty
         // Return hands the keyboard to the one selected tile (Esc in it hands it back).
@@ -164,11 +165,12 @@ final class CanvasView: NSScrollView {
     let remote: RemoteSource?
     /// What the user had going on a remote board's provisional objects the host's ids replaced
     /// (`Board.onHostRekey`): carried to the host's object when it shows.
-    private var rekeyed: [ObjectID: (selected: Bool, draft: NoteTile.Draft?)] = [:]
+    private var rekeyed: [ObjectID: (selected: Bool, draft: NoteTile.Draft?, browser: TileFrameView?)] = [:]
     /// Whether the opening view is in place: nothing is saved before it, or a board closed in its
     /// first turn would record the unplaced view over the real one.
     private var viewPlaced = false
     private var viewportSave: DispatchWorkItem?
+    private(set) var discarded = false
     /// The saved view this board opened with, held until the user first moves the view: the
     /// window can still change size after the board opens (a tab joining the group, the saved
     /// frame, a hidden tab shown), and the view shows that centre through it, not the corner
@@ -265,11 +267,13 @@ final class CanvasView: NSScrollView {
         board.terminalLabel = { [weak self] id in (self?.tiles[id]?.content as? TerminalTile)?.label }
         board.terminalScreen = { [weak self] id in (self?.tiles[id]?.content as? TerminalTile)?.shownText() }
         board.terminalBlockIndex = { [weak self] id, command in (self?.tiles[id]?.content as? TerminalTile)?.blockIndex(of: command) }
-        // A new object on a remote board keeps its selection and a note's unsaved text when the
-        // host's id replaces its provisional one.
+        // A canonical id must not replace a popup's WKWebView and window.opener.
         board.onHostRekey = { [weak self] provisional, host in
             guard let self else { return }
-            self.rekeyed[host] = (self.selection.contains(provisional), (self.tiles[provisional]?.content as? NoteTile)?.takeDraft())
+            let frame = self.tiles[provisional]
+            let browser = frame.flatMap { $0.content is BrowserTile ? $0 : nil }
+            if browser != nil { self.tiles.removeValue(forKey: provisional) }
+            self.rekeyed[host] = (self.selection.contains(provisional), (frame?.content as? NoteTile)?.takeDraft(), browser)
         }
         for object in board.snapshot.objects { add(object) }
         // Markers the user hadn't seen when the board was last open.
@@ -280,6 +284,22 @@ final class CanvasView: NSScrollView {
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
+
+    func discard() {
+        discarded = true
+        viewportSave?.cancel()
+        activitySettle?.cancel()
+        panAnimation?.cancel()
+        mentionFlash?.cancel()
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
+        mouseMonitor = nil
+        NotificationCenter.default.removeObserver(self)
+        for tile in tiles.values {
+            (tile.content as? TerminalTile)?.discard()
+            tile.removeFromSuperview()
+        }
+        tiles.removeAll()
+    }
 
     override func tile() {
         super.tile()
@@ -343,11 +363,18 @@ final class CanvasView: NSScrollView {
     func apply(_ event: BoardEvent) {
         switch event {
         case .objectCreated(let object):
-            add(object)
+            let carried = rekeyed.removeValue(forKey: object.id)
+            let provisional = carried?.browser?.objectID
+            add(object, reusing: carried?.browser)
             restack()
             scheduleGeometry()
-            if let carried = rekeyed.removeValue(forKey: object.id) {
-                if carried.selected { setSelection(selection.union([object.id])) }
+            if let carried {
+                if carried.selected {
+                    var selected = selection
+                    if let provisional { selected.remove(provisional) }
+                    selected.insert(object.id)
+                    setSelection(selected)
+                }
                 if let draft = carried.draft { (tiles[object.id]?.content as? NoteTile)?.resume(draft) }
             }
         case .objectUpdated(let object):
@@ -356,6 +383,8 @@ final class CanvasView: NSScrollView {
             } else if TileFactory.hidden(object) {
                 // Archived: the tile goes, the object stays (unarchiving brings it back).
                 if tiles[object.id] != nil { removeTile(object.id) }
+            } else if let tile = tiles[object.id], object.type == .browser, let remote, (tile.content is BrowserTile) != remote.drawsPage(object) {
+                remount(object)
             } else if let tile = tiles[object.id] {
                 // The user's own resize already laid the content out at this size; any other
                 // (an agent's update or fit, undo) re-aims a code tile at its range.
@@ -395,23 +424,39 @@ final class CanvasView: NSScrollView {
         }
     }
 
-    /// Every remote image tile asks the host for a fresh drawing (`BoardMirror.onRedraw`).
     func redrawRemoteTiles() {
-        for tile in tiles.values { (tile.content as? RemoteImageTile)?.redraw() }
+        for tile in tiles.values {
+            (tile.content as? DiagramTile)?.hostDidReconnect()
+        }
+    }
+
+    func drawingMachinesChanged() {
+        for tile in tiles.values { (tile.content as? RemoteBrowserTile)?.drawingMachinesChanged() }
+    }
+
+    private func remount(_ object: CanvasObject) {
+        tiles.removeValue(forKey: object.id)?.removeFromSuperview()
+        add(object)
+        restack()
+        guard selection.contains(object.id) else { return }
+        tiles[object.id]?.isSelected = !chromeHidden
+        refreshRings()
     }
 
     /// A tile's view off the board (its object deleted, or an archived question), out of the
     /// selection with it.
     private func removeTile(_ id: ObjectID) {
         tiles.removeValue(forKey: id)?.removeFromSuperview()
-        if selection.contains(id) { setSelection(selection.subtracting([id])) }
+        if selection.contains(id), !rekeyed.values.contains(where: { $0.browser?.objectID == id }) {
+            setSelection(selection.subtracting([id]))
+        }
     }
 
-    private func add(_ object: CanvasObject) {
+    private func add(_ object: CanvasObject, reusing preserved: TileFrameView? = nil) {
         if object.type == .group { return addGroup(object) }
         guard tiles[object.id] == nil, TileFactory.hasTile(object.type), !TileFactory.hidden(object) else { return }
         let id = object.id
-        let content = TileFactory.make(object, board: board, remote: remote)
+        let content = preserved?.content ?? TileFactory.make(object, board: board, remote: remote)
         if chromeHidden { (content as? CodeTile)?.setPresenting(true) }
         if let terminal = content as? TerminalTile {
             terminal.onTitle = { [weak self] title in
@@ -486,7 +531,11 @@ final class CanvasView: NSScrollView {
         // The tile made for a page's popup takes the web view WebKit opens it in.
         (content as? BrowserTile)?.browserTile = { [weak self] opened in self?.tiles[opened]?.content as? BrowserTile }
         (content as? BrowserTile)?.hasAttention = { [weak self] tile in self?.selection == [tile] || self?.focusedTile == tile }
-        let tile = TileFrameView(object: object, content: content, frame: Self.docRect(object.frame))
+        let tile = preserved ?? TileFrameView(object: object, content: content, frame: Self.docRect(object.frame))
+        if preserved != nil {
+            tile.rekey(object)
+            tile.place(Self.docRect(object.frame), zoom: CGFloat(object.zoom))
+        }
         tile.onFrameCommit = { [weak self] rect in
             _ = try? self?.board.update(id, frame: Self.canvasFrame(rect))
         }
@@ -501,18 +550,18 @@ final class CanvasView: NSScrollView {
         tile.onMoveEnded = { [weak self] event in self?.endMove(event) }
         tile.onTitleDoubleClick = { [weak self] in self?.focus(tile: id) }
         tile.onMenu = { [weak self, weak tile] event in
+            guard self?.remote?.mirror.availability != .closed else { return NSMenu() }
             // A right-click on the tile's body mentions what is under it; on its title bar, the tile.
             let point = tile.map { $0.content.convert(event.locationInWindow, from: nil) }
             return self?.objectMenu(for: id, at: point.flatMap { point in tile?.content.bounds.contains(point) == true ? point : nil })
         }
+        tile.setHostBoardClosed(remote?.mirror.availability == .closed)
         // Created where it wouldn't be live (a batch building a board zoomed out or offscreen),
         // a code, note, or HTML tile starts as its card rather than building its live view for
         // the liveness pass to swap out. Terminals and browsers start live: they run a session
-        // or a page an agent may be driving. A remote board's browser tile is the host's picture
-        // (`RemoteImageTile`) and starts as its card like the rest, so it asks the host for nothing
-        // until it is near the view.
+        // or a page an agent may be driving.
         if !(content is TerminalTile), !(content is BrowserTile), !magnifying, !shouldBeLive(tile, scale: magnification) { tile.startAsCard() }
-        document.addSubview(tile, positioned: .below, relativeTo: shapeLayer ?? overlay)
+        if tile.superview == nil { document.addSubview(tile, positioned: .below, relativeTo: shapeLayer ?? overlay) }
         tiles[id] = tile
         tile.zoomedOut = RenderMath.isZoomedOut(magnification: magnification, zoom: tile.zoom)
         if object.type == .terminal { lifecycleChanged(object) }
@@ -601,7 +650,9 @@ final class CanvasView: NSScrollView {
         scheduleActivitySettle()
         refreshRings()
         // Selecting a marked object is the user acknowledging it.
-        for id in added where markers[id] != nil { board.clearAttention(id) }
+        if remote?.mirror.availability != .closed {
+            for id in added where markers[id] != nil { board.clearAttention(id) }
+        }
         // The keyboard never stays behind in a tile the selection left (`KeyboardFocus`).
         hand(KeyboardFocus.afterSelectionChange(ids, holder: keyboardHolder))
         onSelectionChange?()
@@ -622,6 +673,7 @@ final class CanvasView: NSScrollView {
     }
 
     func selectAll() {
+        guard remote?.mirror.availability != .closed else { return }
         let scope = enteredGroup.flatMap { groups[$0]?.members }.map(Set.init)
         setSelection(Set(selectableRects().map(\.id).filter { scope?.contains($0) ?? true }))
     }
@@ -717,7 +769,7 @@ final class CanvasView: NSScrollView {
     /// and still receive the click (a terminal keeps focusing); drawn objects are selected and
     /// dragged here because they have no view of their own.
     private func handleMouse(_ event: NSEvent) -> NSEvent? {
-        guard event.window === window, !HyperMonitor.isHyper(event.modifierFlags) else { return event }
+        guard !isHidden, remote?.mirror.availability != .closed, event.window === window, !HyperMonitor.isHyper(event.modifierFlags) else { return event }
         switch event.type {
         case .leftMouseDown:
             guard let hit = hitView(event), hit.isDescendant(of: document) else { return event }
@@ -957,7 +1009,7 @@ final class CanvasView: NSScrollView {
     /// remaining tile takes the selection (and a terminal the keyboard), so the next ⌘W closes
     /// that rather than the window.
     func delete(_ ids: [ObjectID], selectingNext: Bool = false) {
-        guard !ids.isEmpty else { return }
+        guard remote?.mirror.availability != .closed, !ids.isEmpty else { return }
         let terminals = ids.filter { tiles[$0]?.content is TerminalTile }
         guard !terminals.isEmpty else { return remove(ids, selectingNext: selectingNext) }
         guard let window else { return }
@@ -976,7 +1028,7 @@ final class CanvasView: NSScrollView {
         close.hasDestructiveAction = true
         let previous = window.firstResponder
         alert.beginSheetModal(for: window) { [weak self] response in
-            guard let self else { return }
+            guard let self, self.remote?.mirror.availability != .closed else { return }
             guard response == .alertSecondButtonReturn else {
                 // Cancelled: the keyboard goes back to whoever had it (the terminal asked about).
                 if let window = self.window { Self.returnKeyboard(to: previous, in: window) }
@@ -990,6 +1042,7 @@ final class CanvasView: NSScrollView {
     /// Deletes objects as one undo step without asking (the close sheet, or the board's own
     /// close sheet in `CanvasWindowController`, has).
     func remove(_ ids: [ObjectID], selectingNext: Bool = false) {
+        guard remote?.mirror.availability != .closed else { return }
         let closed = ids.compactMap { tiles[$0]?.frame }
         board.transaction {
             for id in ids.sorted() { try? board.delete(id) }
@@ -1023,7 +1076,7 @@ final class CanvasView: NSScrollView {
     }
 
     func bringToFront() {
-        guard !board.isRemote else { return showNotice("Restacking isn't sent to a remote board's host yet") }
+        if let unavailable = board.hostHistoryUnavailable { return showNotice(unavailable) }
         let ids = expandedSelection().sorted { (board.objects[$0]?.z ?? 0) < (board.objects[$1]?.z ?? 0) }
         var top = board.objects.values.map(\.z).max() ?? 0
         board.transaction {
@@ -1035,7 +1088,7 @@ final class CanvasView: NSScrollView {
     }
 
     func sendToBack() {
-        guard !board.isRemote else { return showNotice("Restacking isn't sent to a remote board's host yet") }
+        if let unavailable = board.hostHistoryUnavailable { return showNotice(unavailable) }
         let ids = expandedSelection().sorted { (board.objects[$0]?.z ?? 0) > (board.objects[$1]?.z ?? 0) }
         var bottom = board.objects.values.map(\.z).min() ?? 0
         board.transaction {
@@ -1450,7 +1503,7 @@ final class CanvasView: NSScrollView {
         menu.addItem(.separator())
         menu.addItem(MenuAction.item("Copy as Image") { [weak self] in self?.copySelectionAsImage() })
         menu.addItem(MenuAction.item("Save as PNG…") { [weak self] in self?.saveSelectionAsPNG() })
-        if count == 1, board.objects[id]?.type == .html {
+        if count == 1, board.objects[id]?.type == .html, !board.isRemote {
             menu.addItem(MenuAction.item("Save as HTML…") { [weak self] in self?.saveHTML(id) })
             menu.addItem(MenuAction.item("Open in Browser") { [weak self] in self?.openHTMLInBrowser(id) })
         }
@@ -1520,7 +1573,7 @@ final class CanvasView: NSScrollView {
     }
 
     private func apply(zoomChanges changes: [(CanvasObject, Double)]) {
-        guard !changes.isEmpty else { return }
+        guard remote?.mirror.availability != .closed, !changes.isEmpty else { return }
         board.transaction {
             for (object, zoom) in changes {
                 if object.type == .shape {
@@ -1731,13 +1784,19 @@ final class CanvasView: NSScrollView {
         case .system:
             super.scrollWheel(with: event)
         case .pan(let dx, let dy):
-            let origin = contentView.bounds.origin
-            scroll(to: NSPoint(x: origin.x - dx / magnification, y: origin.y - dy / magnification))
+            pan(by: CGSize(width: dx, height: dy))
         case .zoom(let factor):
             // A window-less event (input replay) carries its screen location.
             let point = event.window == nil ? window?.convertPoint(fromScreen: event.locationInWindow) ?? event.locationInWindow : event.locationInWindow
             zoom(by: factor, around: contentView.convert(point, from: nil))
         }
+    }
+
+    /// Moves the content by `delta` screen points (positive y: down): a wheel notch, a middle-button
+    /// drag step (`CanvasWindow`).
+    func pan(by delta: CGSize) {
+        let origin = contentView.bounds.origin
+        scroll(to: NSPoint(x: origin.x - delta.width / magnification, y: origin.y - delta.height / magnification))
     }
 
     /// The zoom times `factor` (within the limits), keeping the document point `anchor` where it
@@ -2284,6 +2343,7 @@ final class CanvasView: NSScrollView {
     }
 
     private func didSee(_ id: ObjectID) {
+        guard remote?.mirror.availability != .closed else { return }
         if tiles[id]?.content is TerminalTile {
             seenLocally.insert(id)
             board.markSeen(id)
@@ -2366,7 +2426,7 @@ final class CanvasView: NSScrollView {
         guard !livenessScheduled else { return }
         livenessScheduled = true
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.discarded else { return }
             self.livenessScheduled = false
             self.updateScene()
         }
@@ -2388,13 +2448,15 @@ final class CanvasView: NSScrollView {
         }
         // Mid-pinch, LOD flips wait for the gesture to end.
         if !magnifying {
+            let closed = remote?.mirror.availability == .closed
             let scale = magnification
             for tile in tiles.values {
+                if closed, !(tile.content is NoteTile || tile.content is CodeTile || tile.content is TerminalTile || tile.content is QuestionTile || tile.content is ChangesTile) { continue }
                 tile.setLive(shouldBeLive(tile, scale: scale))
                 tile.zoomedOut = RenderMath.isZoomedOut(magnification: scale, zoom: tile.zoom)
             }
             // A web page's viewport follows its view's device-pixel size (`BrowserTile.webViewFrame`).
-            if scale != settledMagnification {
+            if !closed, scale != settledMagnification {
                 settledMagnification = scale
                 for tile in tiles.values { (tile.content as? BrowserTile)?.zoomChanged() }
             }

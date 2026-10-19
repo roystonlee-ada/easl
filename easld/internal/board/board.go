@@ -74,8 +74,9 @@ type refit struct {
 
 // Board is one canvas for one root directory.
 type Board struct {
-	id   string
-	root string
+	id     string
+	root   string
+	closed bool
 
 	objects  map[string]model.Object
 	revision int
@@ -84,12 +85,15 @@ type Board struct {
 	Delivered int
 	attention map[string]store.Attention
 	// Repo is the repository this board is for; nil outside git.
-	Repo            *store.RepoRecord
-	workingWorktree *store.Worktree
-	promptTarget    store.PromptTargetState
-	handoffs        map[string][]Handoff
-	finalAnswers    map[string]string
-	turnErrors      map[string]string
+	Repo             *store.RepoRecord
+	workingWorktree  *store.Worktree
+	promptTarget     store.PromptTargetState
+	handoffs         map[string][]Handoff
+	composerPrompts  map[string][]ComposerPrompt
+	composerNotices  []composerNotice
+	composerReceipts []map[string]any
+	finalAnswers     map[string]string
+	turnErrors       map[string]string
 	// aliases are names terminals had before a rename, each still addressing its terminal
 	// (AgentAddress) until another terminal on this board takes it; saved with the board.
 	aliases map[string]string
@@ -131,6 +135,9 @@ type Board struct {
 	refitDeferral int
 	pendingRefits []refit
 
+	viewers    map[string]*viewerHistory
+	viewerTick uint64
+
 	workingDirectories map[string]string
 	// unknown is the board file's top-level keys easld doesn't know, written back as they were.
 	unknown map[string]any
@@ -156,13 +163,18 @@ type Board struct {
 	settled *route.Result
 
 	// Lock is what serialises this board's work with everyone else's (the registry's Mu); the
-	// question expiry timer takes it to expire questions as a request would. A board without
-	// one (outside a registry) sets no timer: ExpireQuestions is the caller's.
+	// question timer takes it to expire or archive questions as a request would. A board without
+	// one (outside a registry) sets no timer: ExpireQuestions and ArchiveQuestions are the caller's.
 	Lock sync.Locker
-	// questionExpiry is the pending check for the earliest open question's expiresAt
-	// (Board.questionExpiry); expirySeq tells a timer that was replaced.
-	questionExpiry *time.Timer
-	expirySeq      int
+	// questionExpiry is the pending check for the earliest open expiresAt or closed archive
+	// deadline (Board.questionExpiry); expirySeq tells a timer that was replaced.
+	questionExpiry    *time.Timer
+	expirySeq         int
+	composerExpiry    *time.Timer
+	composerExpirySeq int
+	// defaultQuestionArchiveAfter is the host delay for a new question that names none.
+	// The registry copies it on open; a standalone board is the historical 10. Not saved.
+	defaultQuestionArchiveAfter float64
 }
 
 // New is an empty board.
@@ -170,12 +182,14 @@ func New(id, root string) *Board {
 	return &Board{
 		id: id, root: root,
 		objects: map[string]model.Object{}, attention: map[string]store.Attention{}, handoffs: map[string][]Handoff{},
-		finalAnswers: map[string]string{}, turnErrors: map[string]string{}, changedAt: map[string]int{},
+		composerPrompts: map[string][]ComposerPrompt{},
+		finalAnswers:    map[string]string{}, turnErrors: map[string]string{}, changedAt: map[string]int{},
 		keyHolders: map[string]map[string]bool{}, seenSinceWorking: map[string]bool{}, lifecycleSeq: map[string]int{},
 		aliases: map[string]string{}, messages: map[string][]Message{},
 		pendingApprovals: map[string][]approval{}, relaunchedAgents: map[string]bool{}, restartingAgents: map[string]bool{}, revHighWater: map[string]int{}, history: newHistory(),
 		Activity: NewActivityLog(DefaultActivityCapacity, nil), replayActor: UserActor, cascades: map[string]cascade{}, cascadeRev: -1,
-		workingDirectories: map[string]string{}, promptTarget: store.PromptTargetState{FocusOrder: []string{}},
+		workingDirectories: map[string]string{}, promptTarget: store.PromptTargetState{FocusOrder: []string{}}, viewers: map[string]*viewerHistory{},
+		defaultQuestionArchiveAfter: question.DefaultArchiveAfter,
 	}
 }
 
@@ -237,6 +251,9 @@ func FromSnapshot(s *store.Snapshot) *Board {
 	}
 	for _, a := range s.Attention {
 		if _, ok := b.objects[a.Object]; ok {
+			if a.Stamp == "" {
+				a.Stamp = AttentionStamp(a.RaisedAt)
+			}
 			b.attention[a.Object] = a
 		}
 	}
@@ -488,6 +505,9 @@ func (b *Board) Create(typ model.ObjectType, props map[string]any, frame *model.
 		props = map[string]any{}
 	}
 	props, _ = model.Clone(props).(map[string]any)
+	if typ == model.Browser {
+		delete(props, "urlIntent")
+	}
 	w, h := DefaultSize(typ)
 	if typ == model.Question {
 		w, h = question.Size(props)
@@ -528,16 +548,40 @@ func (b *Board) Create(typ model.ObjectType, props map[string]any, frame *model.
 // credits the activity log entry to someone other than the caller ("" for the caller); the
 // system's writes are never recorded.
 func (b *Board) Update(id string, rev *int, frame *model.Frame, z *float64, props map[string]any, caller string, actor Actor) (model.Object, error) {
+	return b.update(id, rev, frame, z, props, caller, actor, false)
+}
+
+// ReportBrowserURL records an observed page commit without creating navigation intent.
+func (b *Board) ReportBrowserURL(id, url, caller string, actor Actor) (model.Object, error) {
+	return b.update(id, nil, nil, nil, map[string]any{"url": url}, caller, actor, true)
+}
+
+func (b *Board) update(id string, rev *int, frame *model.Frame, z *float64, props map[string]any, caller string, actor Actor, observedURL bool) (model.Object, error) {
 	if actor == SystemActor {
 		var out model.Object
 		err := b.unrecorded(func() error {
 			var err error
-			out, err = b.write(id, rev, frame, z, props, caller, actor, "", nil)
+			out, err = b.write(id, rev, frame, z, props, caller, actor, "", nil, observedURL)
 			return err
 		})
 		return out, err
 	}
-	return b.write(id, rev, frame, z, props, caller, actor, "", nil)
+	return b.write(id, rev, frame, z, props, caller, actor, "", nil, observedURL)
+}
+
+// Announce sends an ephemeral event. Nothing is stored.
+func (b *Board) Announce(name string, data any) { b.emit(name, data) }
+
+// WriteQuiet stores props without a rev bump, undo step or activity entry. A fill of a
+// missing drawing machine uses it: the choice is visible and saved, and disconnect does
+// not move it.
+func (b *Board) WriteQuiet(id string, props map[string]any) error {
+	before, err := b.Object(id)
+	if err != nil {
+		return err
+	}
+	b.commitBookkeeping(before, props)
+	return nil
 }
 
 // WriteBookkeeping writes props the app keeps about an object rather than its content: stored,
@@ -591,7 +635,7 @@ func (b *Board) commitBookkeeping(before model.Object, props map[string]any) {
 
 // write is update, re-bounding the groups that contain the object in the same step. refitting
 // holds the groups already being re-bounded; cause marks a cascade of another change.
-func (b *Board) write(id string, rev *int, frame *model.Frame, z *float64, props map[string]any, caller string, actor Actor, cause string, refitting map[string]bool) (model.Object, error) {
+func (b *Board) write(id string, rev *int, frame *model.Frame, z *float64, props map[string]any, caller string, actor Actor, cause string, refitting map[string]bool, observedURL bool) (model.Object, error) {
 	before, err := b.Object(id)
 	if err != nil {
 		return before, err
@@ -610,7 +654,15 @@ func (b *Board) write(id string, rev *int, frame *model.Frame, z *float64, props
 		o.Z = *z
 	}
 	if props != nil {
+		intent, hasIntent := o.Props["urlIntent"]
 		o.Props, _ = model.Merge(o.Props, props).(map[string]any)
+		if o.Type == model.Browser {
+			if hasIntent {
+				o.Props["urlIntent"] = intent
+			} else {
+				delete(o.Props, "urlIntent")
+			}
+		}
 		if o.Type == model.Code {
 			if _, given := props["anchor"]; !given {
 				if !jsonEqualKey(o.Props, before.Props, "range") || !jsonEqualKey(o.Props, before.Props, "path") {
@@ -631,6 +683,15 @@ func (b *Board) write(id string, rev *int, frame *model.Frame, z *float64, props
 	o.UpdatedAt = time.Now()
 	updatedBy := model.ActorFor(caller)
 	o.UpdatedBy = &updatedBy
+	if o.Type == model.Browser && !observedURL {
+		if url, present := props["url"]; present {
+			if url, ok := url.(string); ok {
+				o.Props["urlIntent"] = map[string]any{"url": url, "rev": float64(o.Rev), "actor": updatedBy.JSON()}
+			} else {
+				delete(o.Props, "urlIntent")
+			}
+		}
+	}
 	credited := actor
 	if credited == "" {
 		credited = ActorFor(caller)
@@ -645,7 +706,6 @@ func (b *Board) write(id string, rev *int, frame *model.Frame, z *float64, props
 	}
 	b.markMentionsEdited(before, o)
 	data := o.APIJSON()
-	b.reanchorShown(before, o)
 	b.emit(EventObjectUpdated, data)
 	if o.Type == model.Question {
 		b.questionWritten(before, o)
@@ -721,6 +781,7 @@ func (b *Board) Delete(id, caller string) error {
 	}
 	b.tray = kept
 	b.forgetHandoffs(id)
+	b.ForgetComposerPrompts(id)
 	b.forgetMessages(removed)
 	_, marked := b.attention[id]
 	delete(b.attention, id)
@@ -744,7 +805,7 @@ func (b *Board) Delete(id, caller string) error {
 		}
 	} else if of, ok := removed.Props["followOf"].(string); ok {
 		if terminal, ok := b.objects[of]; ok && terminal.Props["follow"] != false {
-			_, _ = b.write(terminal.ID, nil, nil, nil, map[string]any{"follow": false}, caller, actor, "its follow tile was closed", nil)
+			_, _ = b.write(terminal.ID, nil, nil, nil, map[string]any{"follow": false}, caller, actor, "its follow tile was closed", nil, false)
 		}
 	}
 	return nil
@@ -795,9 +856,9 @@ func (b *Board) log(kind string, o model.Object, actor Actor, summary, cause str
 	b.cascades[o.ID] = cascade{seq: b.Activity.Cursor(), actor: actor, before: first}
 }
 
-// restore puts an object state back verbatim (same id and z), with a revision newer than any it
-// has had, announced as a normal change.
-func (b *Board) restore(o model.Object) {
+// restore puts an object's content back (same id and z), with a revision newer than any it
+// has had. Restored browser URLs carry fresh intent so drawing clients can undo navigation.
+func (b *Board) restore(o model.Object, intentActor model.Actor) {
 	previous, existed := b.objects[o.ID]
 	high := b.revHighWater[o.ID]
 	if existed && previous.Rev > high {
@@ -807,6 +868,13 @@ func (b *Board) restore(o model.Object) {
 		high = o.Rev
 	}
 	o.Rev = high + 1
+	if existed && o.Type == model.Browser && (!jsonEqualKey(previous.Props, o.Props, "url") || !jsonEqualKey(previous.Props, o.Props, "urlIntent")) {
+		if url, ok := o.Props["url"].(string); ok {
+			o.Props["urlIntent"] = map[string]any{"url": url, "rev": float64(o.Rev), "actor": intentActor.JSON()}
+		} else {
+			delete(o.Props, "urlIntent")
+		}
+	}
 	b.commit(o)
 	metrics.Shared.Record("board.undo", 0, 0)
 	if existed {
@@ -875,6 +943,7 @@ func (b *Board) bumpRevision() {
 func (b *Board) endStep() {
 	b.history.end()
 	b.flushBounces()
+	b.flushComposerNotices()
 	b.flushTerminals()
 }
 
@@ -919,6 +988,7 @@ func (b *Board) Atomically(body func() error) error {
 	b.history.begin()
 	mark := b.history.mark()
 	handed, queued, named := maps.Clone(b.handoffs), maps.Clone(b.messages), maps.Clone(b.aliases)
+	prompts, notices := cloneComposerPrompts(b.composerPrompts), cloneComposerNotices(b.composerNotices)
 	defer func() {
 		b.endStep()
 		if outermost {
@@ -930,6 +1000,8 @@ func (b *Board) Atomically(body func() error) error {
 		b.revert(b.history.discard(mark))
 		b.replayVerb, b.replayActor = "", UserActor
 		b.handoffs, b.messages, b.aliases = handed, queued, named
+		b.composerPrompts, b.composerNotices = prompts, notices
+		b.scheduleComposerExpiry()
 		return err
 	}
 	return nil
@@ -1036,7 +1108,7 @@ func (b *Board) detachArrows(id string, actor Actor, caller string) {
 		if spec.To.Object == id {
 			spec.To = route.Binding{Point: path[len(path)-1]}
 		}
-		_, _ = b.write(x.arrow.ID, nil, nil, nil, map[string]any{"from": spec.From.JSON(), "to": spec.To.JSON()}, caller, actor, "bound object "+id+" deleted", nil)
+		_, _ = b.write(x.arrow.ID, nil, nil, nil, map[string]any{"from": spec.From.JSON(), "to": spec.To.JSON()}, caller, actor, "bound object "+id+" deleted", nil, false)
 	}
 }
 

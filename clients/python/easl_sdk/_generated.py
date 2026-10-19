@@ -7,7 +7,7 @@ import inspect
 import re
 from typing import Any, Callable, Literal, NotRequired, Required, TypedDict, TypeVar, Union
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ENV_DEFAULTS = {"caller":"EASL_TILE_ID","board":"EASL_BOARD_ID"}
 
 _Api = TypeVar("_Api")
@@ -35,6 +35,80 @@ def _snake_case_hints(cls: type[_Api]) -> type[_Api]:
         setattr(cls, name, hinted())
     return cls
 
+
+ViewerId = str
+
+class ComposerReceipt(TypedDict):
+    receipt: Required["Id"]
+    event: Required[Literal["composer.returned", "composer.submitted"]]
+    viewer: Required["ViewerId"]
+    terminal: Required["Id"]
+    ids: Required[list["Id"]]
+
+class AttentionMarker(TypedDict):
+    id: Required["Id"]
+    message: NotRequired[str]
+    raisedBy: NotRequired["Id"]
+    raisedAt: Required[str]
+
+class ViewerReplay(TypedDict):
+    step: NotRequired[int]
+    pushed: Required[bool]
+    retired: NotRequired[bool]
+    changed: Required[list["CanvasObject"]]
+    deleted: Required[list["Id"]]
+    kept: Required[list["Id"]]
+
+SurfaceStream = str
+
+class SurfaceSize(TypedDict):
+    """Host WKWebView bounds in points, top-left origin. Input uses these points, not CSS pixels or encoded image pixels."""
+    w: Required[float]
+    h: Required[float]
+
+SurfaceInputEvent = Union[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]
+
+class SurfaceFrame(TypedDict):
+    """surface.frame data. Full current page image held in memory, never a profile, cookie jar, page source, dirty rectangle or image-less acknowledgement. Only the subscribed owning connection receives it."""
+    stream: Required["SurfaceStream"]
+    seq: Required[int]
+    input: Required[int]
+    size: Required["SurfaceSize"]
+    scale: Required[float]
+    format: Required[Literal["jpeg", "png"]]
+    data: Required[str]
+    width: Required[int]
+    height: Required[int]
+    back: Required[bool]
+    forward: Required[bool]
+    loading: Required[bool]
+
+class SurfaceDialog(TypedDict):
+    """surface.dialog data, private to the subscribed owning connection. Completed once by surface.answer, safely dismissed when the connection or stream closes."""
+    stream: Required["SurfaceStream"]
+    dialog: Required[str]
+    kind: Required[Literal["alert", "confirm", "prompt", "login", "select"]]
+    origin: Required[str]
+    message: NotRequired[str]
+    text: NotRequired[str]
+    choices: NotRequired[list[str]]
+    selected: NotRequired[int]
+
+class SurfaceNotice(TypedDict):
+    """surface.notice data, private to the subscribed owning connection. Downloads remain host files. File uploads are refused, not silently accepted."""
+    stream: Required["SurfaceStream"]
+    kind: Required[Literal["closed", "download", "refused"]]
+    reason: NotRequired[str]
+    name: NotRequired[str]
+    state: NotRequired[str]
+
+SurfaceEvent = Union[dict[str, Any], dict[str, Any], dict[str, Any]]
+
+class BoardLifecycleEvent(TypedDict):
+    """Board availability after a successful registry transition. The envelope names the canonical board and data is empty. Closing does not disconnect subscriptions; reopening the board announces its availability on those same subscriptions."""
+    event: Required[Literal["board.closed", "board.opened"]]
+    board: Required["Id"]
+    data: Required[dict[str, Any]]
 
 Id = str
 
@@ -89,10 +163,16 @@ class TerminalProps(TypedDict):
     worktree: NotRequired[str]
     branch: NotRequired[str]
 
+class DrawingMachine(TypedDict):
+    id: Required["Id"]
+    host: Required[str]
+
 class BrowserProps(TypedDict):
     url: Required[str]
+    urlIntent: NotRequired[dict[str, Any]]
     title: NotRequired[str]
     pageTitle: NotRequired[str]
+    drawingMachine: NotRequired["DrawingMachine"]
     zoom: NotRequired["Zoom"]
     profile: NotRequired[str]
     reloadOnChange: NotRequired[bool]
@@ -169,7 +249,7 @@ class DiagramProps(TypedDict):
     key: NotRequired["ObjectKey"]
 
 class QuestionProps(TypedDict):
-    """A question an agent (or a script elsewhere) asks the user on the board instead of in chat; the user answers it on its tile (`easl ask` is the CLI for it). Lifecycle: status open → answered | cancelled | expired, each final; a closed question takes only `archived` (and key, zoom). Validated on create and update (invalid_params names the rule): option ids unique, `recommended` and `answer.option` name an option, `answer` exactly when answered. A new question without a frame is sized from its props: 460 wide, 194 + 50 per option (+ 30 with context) tall while open; closing it shrinks it to 148 (+ 40 with a note). Open questions are on the user's ⌘J needs-you list and the board's open-asks count. Answered, it reaches the asker as an object.updated event and, when `asker.tile` is a terminal on the board, as a mention of the question with that terminal's next prompt (never typed into it). An open question past `expiresAt` becomes expired (by easl, no undo step)"""
+    """A question an agent (or a script elsewhere) asks the user on the board instead of in chat; the user answers it on its tile (`easl ask` is the CLI for it). Lifecycle: status open → answered | cancelled | expired, each final; a closed question takes only `archived`, `keep`, and `archiveAfter` (and key, zoom). Validated on create and update (invalid_params names the rule): option ids unique, `recommended` and `answer.option` name an option, `answer` exactly when answered. A new question without a frame is sized from its props: 460 wide, 194 + 50 per option (+ 30 with context) tall while open; closing it shrinks it to 148 (+ 40 with a note). Open questions are on the user's ⌘J needs-you list and the board's open-asks count. Answered, it reaches the asker as an object.updated event and, when `asker.tile` is a terminal on the board, as a mention of the question with that terminal's next prompt (never typed into it). An open question past `expiresAt` becomes expired (by easl, no undo step). A closed question that is not kept is archived by the host `archiveAfter` seconds after its `updatedAt` (default 10, at most 86400), on the same timer as expiry, as the app's own write (object.updated, persisted, no undo step). `keep: true` exempts that, not expiry or an explicit archive. null removes `keep` or `archiveAfter` and restores the default. Moving, zooming, changing retention, or unarchiving restarts the delay from the new `updatedAt`."""
     question: Required[str]
     options: Required[list[dict[str, Any]]]
     recommended: NotRequired[str]
@@ -179,6 +259,8 @@ class QuestionProps(TypedDict):
     expiresAt: NotRequired[str]
     answer: NotRequired[dict[str, Any]]
     archived: NotRequired[bool]
+    keep: NotRequired[bool]
+    archiveAfter: NotRequired[float]
     zoom: NotRequired["Zoom"]
     key: NotRequired["ObjectKey"]
 
@@ -275,7 +357,7 @@ class Mention(TypedDict):
     id: Required["Id"]
     target: Required["MentionTarget"]
     label: Required[str]
-    stagedAt: Required[str]
+    stagedAt: Required[Union[float, str]]
     edited: Required[bool]
 
 class ResolvedMention(TypedDict):
@@ -387,6 +469,36 @@ class MetricsCounter(TypedDict):
     last10m: Required["MetricsTally"]
 
 @_snake_case_hints
+class SurfaceApi:
+    def __init__(self, call: Callable[[str, dict[str, Any], list[str]], Any]) -> None:
+        self._call = call
+
+    def stream(self, *, id: str, scale: float | None = None, format: Literal["jpeg", "png"] | None = None) -> dict[str, Any]:
+        """Open a connection-owned stream of the existing browser WKWebView, not a new page. Requires events.subscribe for surface.frame and the tile's canonical board on this same connection. Starts with outstanding frame 0; no frame event is sent until surface.ack frame 0. At most one frame is outstanding, credits never accumulate. Currently served by the Swift app only; easld relay is not implemented."""
+        params = {"id": id, "scale": scale, "format": format}
+        return self._call("surface.stream", params, [])
+
+    def ack(self, *, stream: "SurfaceStream", frame: int) -> dict[str, Any]:
+        """On the opening connection, acknowledge exactly the outstanding frame to grant one next frame. Initial ack is frame 0. Older acknowledgements are ignored; future frames are invalid_params. Decode and install the image before acknowledging."""
+        params = {"stream": stream, "frame": frame}
+        return self._call("surface.ack", params, [])
+
+    def input(self, *, stream: "SurfaceStream", events: list["SurfaceInputEvent"]) -> dict[str, Any]:
+        """Queue ordered native input for the opening connection's existing browser. Validate the entire bounded batch before any mutation. seq values are positive and strictly increasing within the batch; previously accepted events are ignored. Never automatically resend input. Acceptance means queueing only. A later frame input watermark has the processing limitations documented by SurfaceFrame. Result text is present only for an explicit copy operation."""
+        params = {"stream": stream, "events": events}
+        return self._call("surface.input", params, [])
+
+    def answer(self, *, stream: "SurfaceStream", dialog: str, accept: bool, text: str | None = None, user: str | None = None, password: str | None = None, choice: int | None = None) -> dict[str, Any]:
+        """Complete one pending dialog on its stream's opening connection. A closed stream safely dismisses pending dialogs. Auth passwords are transient request data, never logged or read from the viewer's keychain."""
+        params = {"stream": stream, "dialog": dialog, "accept": accept, "text": text, "user": user, "password": password, "choice": choice}
+        return self._call("surface.answer", params, [])
+
+    def stop(self, *, stream: "SurfaceStream") -> dict[str, Any]:
+        """Stop the opening connection's stream and cancel its capture work. Never delete or release the host page; its existing driven-lease policy takes over. Another connection cannot control this stream."""
+        params = {"stream": stream}
+        return self._call("surface.stop", params, [])
+
+@_snake_case_hints
 class SystemApi:
     def __init__(self, call: Callable[[str, dict[str, Any], list[str]], Any]) -> None:
         self._call = call
@@ -406,15 +518,30 @@ class AppApi:
         params = {"reset": reset, "watch": watch}
         return self._call("app.metrics", params, [])
 
+    def update(self, *, mode: Literal["check", "install"]) -> dict[str, Any]:
+        """Check for or install an update of the running Mac app without confirmation UI. App socket only, not forwarded by easld. Install ignores idle, uses the manual update trust checks and returns before the app quits and relaunches in the background with its open boards restored. Failures leave the running app intact and are reported in error."""
+        params = {"mode": mode}
+        return self._call("app.update", params, [])
+
 @_snake_case_hints
 class BoardApi:
     def __init__(self, call: Callable[[str, dict[str, Any], list[str]], Any]) -> None:
         self._call = call
 
-    def get(self, *, board: "Id" | None = None, since: int | None = None, branch: str | None = None) -> dict[str, Any]:
+    def get(self, *, board: "Id" | None = None, viewer: "ViewerId" | None = None, since: int | None = None, branch: str | None = None) -> dict[str, Any]:
         """Board manifest: all objects plus a change cursor. Heavy props are summarized (use object.get for them whole): HTML `html` and a follow tile's `history` become a short string, note `markdown` past 400 characters is cut. Objects created or changed since `since` are flagged."""
-        params = {"board": board, "since": since, "branch": branch}
+        params = {"board": board, "viewer": viewer, "since": since, "branch": branch}
         return self._call("board.get", params, ["board"])
+
+    def undo(self, *, viewer: "ViewerId", step: int, board: "Id" | None = None) -> dict[str, Any]:
+        """Undo this remote viewer's latest host-accepted step at or before step. Only fields still equal to the values that step wrote are reverted; concurrent edits remain and their objects appear in kept. The host retains up to 200 steps per viewer in memory. Nothing from another viewer or agent enters this viewer's history."""
+        params = {"board": board, "viewer": viewer, "step": step}
+        return self._call("board.undo", params, ["board"])
+
+    def redo(self, *, viewer: "ViewerId", step: int, board: "Id" | None = None) -> dict[str, Any]:
+        """Redo the fields this viewer's undo actually changed. Fields edited since that undo remain unchanged and their objects appear in kept. A new host-accepted step from this viewer clears its redo history."""
+        params = {"board": board, "viewer": viewer, "step": step}
+        return self._call("board.redo", params, ["board"])
 
     def history(self, *, board: "Id" | None = None, since: Union[int, str] | None = None, limit: int | None = None, kinds: list[Literal["created", "updated", "deleted", "viewport", "selection", "follow", "restart", "message"]] | None = None) -> dict[str, Any]:
         """Activity log: who created, changed, or deleted what (including objects that existed only for seconds), where the user's viewport settled, what they selected, follow-tile re-aims, app starts, and peer messages that bounced (`message`: its receiver's agent ended before taking it, and the sender was a script or takes no messages; the entry's `id` is the receiver). Plain request/response, cheap to poll: pass the returned `cursor` as `since` next time. In memory, newest 2000 entries per board; an app restart starts a new log with a `restart` entry."""
@@ -436,6 +563,11 @@ class BoardApi:
         params = {"host": host, "board": board, "select": select}
         return self._call("board.open_remote", params, [])
 
+    def close(self, *, board: "Id" | None = None, end_sessions: bool | None = None) -> dict[str, Any]:
+        """Close an open board without quitting the server. Save its latest state and remove it from the open set and open-boards.json, but keep its stored board file and board.list entry with open:false. By default terminals and their sessions stay running; board.open of the same root restores them. The Mac app refuses its last open board with conflict, including while hidden or minimized. A remote tab closes only this viewer and never changes the host; any explicit endSessions, including false, is invalid_params there. Unknown or already closed boards are not_found. An affected agent.restart is conflict. Persistence or session-ending failure is unavailable and leaves the board open, with any partial session effects reported. No new event is emitted and subscriptions stay connected."""
+        params = {"board": board, "endSessions": end_sessions}
+        return self._call("board.close", params, ["board"])
+
     def export(self, *, board: "Id" | None = None, path: str | None = None) -> dict[str, Any]:
         """Write a pretty-printed JSON snapshot of an open board (objects, frames, props; not the personal selection tray) into the repo. Committing it is left to the caller."""
         params = {"board": board, "path": path}
@@ -456,14 +588,14 @@ class ObjectApi:
         params = {"board": board, "key": key, "keyPrefix": key_prefix, "type": type, "status": status, "as": as_}
         return self._call("object.find", params, ["board"])
 
-    def create(self, *, type: "ObjectType", props: dict[str, Any], board: "Id" | None = None, frame: Union["Frame", "FitFrame", "SizeFrame"] | None = None, size: Literal["fit"] | None = None, parent: "Id" | None = None, caller: "Id" | None = None) -> dict[str, Any]:
+    def create(self, *, type: "ObjectType", props: dict[str, Any], board: "Id" | None = None, frame: Union["Frame", "FitFrame", "SizeFrame"] | None = None, size: Literal["fit"] | None = None, parent: "Id" | None = None, viewer: "ViewerId" | None = None, step: int | None = None, caller: "Id" | None = None) -> dict[str, Any]:
         """Create an object. Omit `frame` (or give only its `w` and `h`) to let the board place it in the free spot nearest the calling agent's terminal (or the viewport center for users): clear of every tile and group, inside the user's view when the terminal is on screen and there's room within 600 pt of it (else beside it, even out of view). A code tile without a frame is as wide as its file's longest line needs at its `zoom`, from 640 up to 200 columns (1546 at zoom 1; the working-tree file, up to 1 MiB; a follow tile and one shown from git, `ref` or `pinnedCommit`, stay 640), and 446 tall. `size: fit` sizes the frame to the content (object.measure; notes and text wrap at `frame.w`; code is at most `frame.w` wide, default 1546 (200 columns), and wraps longer lines; html is `frame.w` wide, default 640, and as tall as its page at that width, at most 4000; changes shows every hunk, as wide as its longest line up to `frame.w`, default 960, longer lines wrapped, at most 4000 tall, and a fitted changes tile grows with its diff; image is its picture at one point per pixel, scaled down to at most `frame.w`, default 960, plus the title bar and caption; a diagram is its graph: one without `props.graph` is computed first, waiting for the language server up to 60 s as object.reload does, then fitted, and `diagram` says how that went). A note without a frame height is always fitted to its markdown (at `frame.w`, default 280), and an image to its picture, so `frame` may be just x, y, w (or omitted). A note's line-range fences (`file=…#L…`) are stored with the `anchor=` their tile would write back, so the result's `rev` is the one to update with. The caller's tile (EASL_TILE_ID) becomes createdBy. A changes tile the calling agent already made for the same `root`, `base`, and `paths` is reused rather than duplicated: it takes the call's other props, `frame`, and `size`, and the result says `reused: true`."""
-        params = {"board": board, "type": type, "props": props, "frame": frame, "size": size, "parent": parent, "caller": caller}
+        params = {"board": board, "type": type, "props": props, "frame": frame, "size": size, "parent": parent, "viewer": viewer, "step": step, "caller": caller}
         return self._call("object.create", params, ["board","caller"])
 
-    def update(self, *, id: "Id", rev: int | None = None, frame: "FramePatch" | None = None, size: Literal["fit"] | None = None, props: dict[str, Any] | None = None, caller: "Id" | None = None) -> dict[str, Any]:
-        """Patch an object's frame and/or props (shallow merge). `frame` may give any of x, y, w, h; the rest stay. Pass `rev` for optimistic concurrency (a note's fences are anchored as on create). `size: fit` re-measures the frame from the (patched) content at its current position and width (code: at most `frame.w`, default 1546; image: at most `frame.w`, default 960; never their current width), or at `frame` x, y, w. Without `frame` x or y it doesn't grow over objects it didn't already overlap: it grows up and/or left instead (keeping its bottom or right edge), else moves to the nearest free spot no farther than its longer side, else grows in place (the result's `overlaps` names what it covers). After changing an html tile's `html` or a note's `markdown`, pass `size: "fit"` in the same update to refit its height to the new content."""
-        params = {"id": id, "rev": rev, "frame": frame, "size": size, "props": props, "caller": caller}
+    def update(self, *, id: "Id", rev: int | None = None, frame: "FramePatch" | None = None, z: float | None = None, size: Literal["fit"] | None = None, props: dict[str, Any] | None = None, viewer: "ViewerId" | None = None, step: int | None = None, caller: "Id" | None = None) -> dict[str, Any]:
+        """Patch an object's frame, stacking order z, and/or props (shallow merge). `frame` may give any of x, y, w, h; the rest stay. Pass `rev` for optimistic concurrency (a note's fences are anchored as on create). `size: fit` re-measures the frame from the (patched) content at its current position and width (code: at most `frame.w`, default 1546; image: at most `frame.w`, default 960; never their current width), or at `frame` x, y, w. Without `frame` x or y it doesn't grow over objects it didn't already overlap: it grows up and/or left instead (keeping its bottom or right edge), else moves to the nearest free spot no farther than its longer side, else grows in place (the result's `overlaps` names what it covers). After changing an html tile's `html` or a note's `markdown`, pass `size: "fit"` in the same update to refit its height to the new content."""
+        params = {"id": id, "rev": rev, "frame": frame, "z": z, "size": size, "props": props, "viewer": viewer, "step": step, "caller": caller}
         return self._call("object.update", params, ["caller"])
 
     def upsert(self, *, key: "ObjectKey", type: "ObjectType", props: dict[str, Any], board: "Id" | None = None, frame: Union["Frame", "FitFrame", "SizeFrame"] | None = None, size: Literal["fit"] | None = None, caller: "Id" | None = None) -> dict[str, Any]:
@@ -471,9 +603,9 @@ class ObjectApi:
         params = {"board": board, "key": key, "type": type, "props": props, "frame": frame, "size": size, "caller": caller}
         return self._call("object.upsert", params, ["board","caller"])
 
-    def delete(self, *, id: "Id", caller: "Id" | None = None) -> dict[str, Any]:
+    def delete(self, *, id: "Id", viewer: "ViewerId" | None = None, step: int | None = None, caller: "Id" | None = None) -> dict[str, Any]:
         """Delete an object (and remove it from any staged mentions). Arrows bound to it keep their drawn route: that end becomes a free `point` where it last attached."""
-        params = {"id": id, "caller": caller}
+        params = {"id": id, "viewer": viewer, "step": step, "caller": caller}
         return self._call("object.delete", params, ["caller"])
 
     def measure(self, *, type: "ObjectType", props: dict[str, Any], board: "Id" | None = None, width: float | None = None, caller: "Id" | None = None) -> dict[str, Any]:
@@ -576,9 +708,9 @@ class AgentApi:
         params = {}
         return self._call("agent.list", params, [])
 
-    def prompt(self, *, target: str, text: str, mentions: list["PromptMention"] | None = None, caller: "Id" | None = None, from_: str | None = None, when: Literal["now", "next-turn"] | None = None, message: "MessageId" | None = None, force: bool | None = None, composer: bool | None = None, answer: bool | None = None) -> dict[str, Any]:
+    def prompt(self, *, target: str, text: str, mentions: list["PromptMention"] | None = None, staged: list["Mention"] | None = None, viewer: "ViewerId" | None = None, caller: "Id" | None = None, from_: str | None = None, when: Literal["now", "next-turn"] | None = None, message: "MessageId" | None = None, force: bool | None = None, composer: bool | None = None, answer: bool | None = None) -> dict[str, Any]:
         """Prompt another agent. To a terminal whose integration takes messages (agent.report `protocol` ≥ 1: omp's extension) the text goes out of band: it is queued for that terminal and its integration delivers it as a message (agent.inbox), never touching the terminal, so a half-typed draft, an open question or an approval dialog stays as it is. The receiver gets a header naming the sender and how to reply (`write agent://<address>` in omp, `easl tell <address>`). `when: "now"` (the default): a working agent gets it as a steer (at its next step; a wait is cut short), an idle one starts a turn with it, one waiting on a question or approval gets it after the answer. `when: "next-turn"`: never into a running turn; it starts a turn once the running one has ended. Messages arriving together are delivered as one, and each sender wakes a receiver at most 20 times an hour (past that, messages wait for its next turn). A message from a terminal (`caller`) is attributed to an agent; one from a script (`from`, or no `caller`) to the user, named by `from`. A message is for the agent session there as it is sent: when that session ends before its integration takes the message (the agent released, exited, or replaced by another session), the message bounces, back to a sending terminal whose integration takes messages as a message from `easl` (`undelivered to <address>: <its first line>…`), else into the receiver's board.history (`message`); a session that ends while the message is being sent fails the call `unavailable`, and so does a target whose message integration died without releasing its terminal (killed: its shell is back at the prompt), typed or not. Any other target gets the text typed: pasted (bracketed paste; a one-line command into a shell at its prompt is typed) and Enter pressed once the paste has landed (80 ms later: TUIs such as Gemini CLI take an Enter right after input as part of it); the composer always types. The terminal's text just before submitting (or queueing) is remembered, so `agent.read` with `since: "prompt"` returns only what followed. `agent.wait` after it ignores the state the agent was in before this prompt: it answers once the agent has reported `working` (or `blocked`) and then reached one of its `until` states, so wait for `done` right away, not for `working` first; while a message waits to be delivered it doesn't answer at all. A prompt that lands while the agent is `working` (typed, or a `now` message delivered as a steer) joins that turn (omp and Codex take it before the turn ends and answer it in the same turn): the wait answers when that turn ends, and `final` is that turn's answer. For typing only: a `blocked` target fails with `conflict` naming what it waits on (an approval dialog or question would take the text) unless `force` is true. So does a `working` target whose state is `restored` (from before the app last closed, unconfirmed since: it may wait on a question now). So does a target whose agent reports from behind another foreground program (`program` nvim, less: the text would go to that program), and one in tmux whose active pane runs something else (vim, a shell): the text goes to the active pane, so it is sent when that pane runs the agent. A typed `next-turn` prompt to a `working` target fails with `conflict` (typed text would join the turn). Into a shell at its prompt (no agent), a one-line text is typed rather than pasted. `mentions` attach board objects for the receiving agent the way the user's Hyper-click mentions do: they wait for that terminal only (never in the user's tray) and arrive resolved, as hidden context with a typed prompt (its integration's next submitted prompt, this one) or with the message, in a block naming your terminal (`caller`). The target must run an agent with an easl integration (its lifecycle not `via: "notifications"`), else `unavailable`. An agent reporting by notification goes `unknown` with this prompt, and `agent.wait` answers at its next notification (none comes when the text needed no model reply, e.g. aider's `/add`: give such waits a `timeoutMs`)."""
-        params = {"target": target, "text": text, "mentions": mentions, "caller": caller, "from": from_, "when": when, "message": message, "force": force, "composer": composer, "answer": answer}
+        params = {"target": target, "text": text, "mentions": mentions, "staged": staged, "viewer": viewer, "caller": caller, "from": from_, "when": when, "message": message, "force": force, "composer": composer, "answer": answer}
         return self._call("agent.prompt", params, ["caller"])
 
     def wait(self, *, target: str, caller: "Id" | None = None, until: list[Literal["working", "blocked", "idle", "done", "unknown"]] | None = None, timeout_ms: int | None = None) -> dict[str, Any]:
@@ -615,6 +747,11 @@ class FollowApi:
 class ViewApi:
     def __init__(self, call: Callable[[str, dict[str, Any], list[str]], Any]) -> None:
         self._call = call
+
+    def seen(self, *, id: "Id", rev: int | None = None, marker: "AttentionMarker" | None = None) -> dict[str, Any]:
+        """Acknowledge what a viewer saw without rewriting lifecycle props. A marker clears only when its raisedAt still matches marker; a terminal is marked seen only when its current revision equals rev. Working or blocked terminals are never marked seen. Stale acknowledgments leave newer markers and answers unchanged."""
+        params = {"id": id, "rev": rev, "marker": marker}
+        return self._call("view.seen", params, [])
 
     def attention(self, *, id: "Id", message: str | None = None, clear: bool | None = None, caller: "Id" | None = None) -> dict[str, Any]:
         """Raise an attention marker pointing at an object (one per object; raising again replaces its message), or remove it with `clear: true`. A marker belongs to the caller's turn: raising one clears the markers the same caller raised in earlier turns (a turn starts when its lifecycle goes to working from idle, done, or no state; answering an approval, blocked → working, continues the turn); markers from this turn stay. The user seeing the object also clears it. Unseen markers are stored with the board and survive app restarts; deleting the object removes its marker. Never moves the user's viewport."""
@@ -677,7 +814,7 @@ class EventsApi:
         self._call = call
 
     def subscribe(self, *, board: "Id" | None = None, events: list[str] | None = None) -> dict[str, Any]:
-        """Turn this connection into an event stream. Events: object.created, object.updated, object.deleted, tray.changed, agent.lifecycle, follow.updated, attention.changed ({id, active, message?, raisedBy?})."""
+        """Turn this connection into an event stream. Events: object.created, object.updated, object.deleted, tray.changed, agent.lifecycle, follow.updated, attention.changed ({id, active, message?, raisedBy?, raisedAt?}), composer.returned and composer.submitted (ComposerReceipt: {receipt, event, viewer, terminal, ids}, original staged mention ids for the originating viewer, never captured targets), client.changed ({clients}, the current attached-client snapshot for this board; transient, never stored), board.closed and board.opened (BoardLifecycleEvent envelopes with canonical board and empty data). A composer submission receipt follows actual queue consumption, not typing or a peek; board.get replays the newest 2000 receipts after a reconnect. Lifecycle events follow successful close and newly opened board transitions only. Subscriptions stay connected across close and reopen; board and event-name filters apply to lifecycle events as to object events. Private surface.frame, surface.dialog and surface.notice use SurfaceEvent envelopes and are sent only to a stream's owning connection after its matching canonical-board subscription, never broadcast to other board subscribers."""
         params = {"board": board, "events": events}
         return self._call("events.subscribe", params, ["board"])
 
@@ -686,10 +823,30 @@ class ClientApi:
     def __init__(self, call: Callable[[str, dict[str, Any], list[str]], Any]) -> None:
         self._call = call
 
-    def attach(self, *, version: int, schema: str, serves: list[str], app: str | None = None, host: str | None = None, boards: list["Id"] | None = None, focused: "Id" | None = None) -> dict[str, Any]:
-        """Make this connection a client that serves what only the Mac app can answer: the window (view.get, view.snapshot), drawing (view.render), live terminal surfaces (agent.prompt, agent.read's screen modes, agent.restart; interim: easld takes them over with zmx sessions, behind the same methods and errors), WebKit and language servers (object.reload), and AppKit text measurement (text.measure). A client built from an older schema `version` than the server's is refused `unavailable` ("easl 0.1.0 on studio is older than this board's server …; update it"); a newer one is accepted and speaks the server's `version` (the reply's), and with the same `version` the two work together whatever their `schema` hashes. Either way each uses what both know: params and `serves` names the server doesn't know are ignored. From then on the server sends this connection requests for the methods in `serves` (transport `clients`): a call that needs a client goes, after the server's own checks, to one that serves its method and shows its board (text.measure: any that serves it), the one whose user focused that board last, else the one focused most recently, else the one attached last. The call is forwarded as the same method with the caller's params (`board` and agent `target` resolved to ids; agent.prompt without `mentions`, which the server queues), and the client's result or error is the caller's. The server waits for object.reload's and view.render's `timeoutMs` plus 5 s and 30 s, else 5 s (view.get), 30 s (view.snapshot), 10 s (agent.prompt, agent.read, agent.restart), 2 s (text.measure); past that, or when the client disconnects first, the call fails `unavailable` (text.measure falls back to the glyph table). With no client for its board a delegated call fails `unavailable` saying what it needs. Attach again whenever `serves`, `boards` or `focused` change: each call replaces the last; closing the connection detaches. Answer text.measure without waiting on the server, which may hold a board while it measures. For the Mac app; agents never need it."""
-        params = {"version": version, "schema": schema, "app": app, "host": host, "serves": serves, "boards": boards, "focused": focused}
+    def attach(self, *, version: int, schema: str, serves: list[str], app: str | None = None, host: str | None = None, identity: "Id" | None = None, boards: list["Id"] | None = None, focused: "Id" | None = None) -> dict[str, Any]:
+        """Attach this connection as a Mac client serving the named methods and open boards, including background boards. The optional identity is persistent per app home; the returned cli_ id identifies only this connection. Older schema versions are refused unavailable; newer versions speak the server's version, and equal versions work across schema hashes. Unknown attach params and serves names are ignored. Calls normally go to the capable viewer that focused this board last, then focused most recently, then attached last. Browser calls and browser object.reload instead go only to the tile's persisted drawingMachine identity. An eligible creator supplies a new browser's default; otherwise the earliest eligible attached Mac supplies it. The first eligible attachment fills existing missing owners. Disconnect never migrates a page. Delegated requests retain their method, with canonical board/target ids. Prompt mentions are queued by easld. HTML measurement receives resolved props and width. Rendering is requested inline without out; only the server writes caller-requested render files. Results and errors otherwise pass through. Reload waits timeoutMs plus 5 s; render waits timeoutMs plus 30 s. Browser wait uses its requested timeout plus grace. Other deadlines are 5 s for view.get, 30 s for view.snapshot, 25 s for HTML object.measure, 10 s for terminal calls and 2 s for text.measure. Missing, disconnected or unresponsive clients fail unavailable, except text.measure falls back to the glyph table. Attach again to replace capabilities, boards or focus; closing detaches. Answer delegated calls without awaiting a new request on this same link, and answer text.measure without any server request because it may hold the board lock."""
+        params = {"version": version, "schema": schema, "app": app, "host": host, "identity": identity, "serves": serves, "boards": boards, "focused": focused}
         return self._call("client.attach", params, [])
+
+    def list(self) -> dict[str, Any]:
+        """The clients attached to easld, including background viewers. Each entry names its app, host, served boards and methods. Entries, boards and methods are sorted by id or name. The Mac app answers unsupported."""
+        params = {}
+        return self._call("client.list", params, [])
+
+@_snake_case_hints
+class BrowserApi:
+    def __init__(self, call: Callable[[str, dict[str, Any], list[str]], Any]) -> None:
+        self._call = call
+
+    def call(self, *, id: "Id", method: Literal["browser.navigate", "browser.back", "browser.forward", "browser.reload", "browser.url.get", "browser.eval", "browser.snapshot", "browser.screenshot", "browser.click", "browser.dblclick", "browser.hover", "browser.focus", "browser.check", "browser.uncheck", "browser.scroll_into_view", "browser.type", "browser.fill", "browser.press", "browser.scroll", "browser.wait"], params: dict[str, Any], caller: "Id" | None = None) -> dict[str, Any]:
+        """Run a page-scoped cmux browser command on this browser tile's persisted drawingMachine. Easld forwards only to that attached identity, never to the most recently focused viewer. The drawing Mac uses its own page and profile. Results and errors pass through in memory; no page body, image, cookie or profile is stored by easld. Offline returns unavailable naming the drawing machine. Structural cmux open, list and close stay on easld. The Mac app's host API answers unsupported; its own agents use the cmux socket."""
+        params = {"id": id, "method": method, "params": params, "caller": caller}
+        return self._call("browser.call", params, ["caller"])
+
+    def report(self, *, id: "Id", url: str | None = None, page_title: Any | None = None, caller: "Id" | None = None, actor: Literal["user", "system"] | None = None) -> dict[str, Any]:
+        """A drawing Mac reports committed page URL and title metadata to easld. Only an attached client serving this board whose persistent identity matches the tile's drawingMachine may report. URL commits preserve agent, user or system credit; pageTitle is bookkeeping with no rev bump. No page body, image, cookie, log or profile field is accepted. The Mac app's host API answers unsupported."""
+        params = {"id": id, "url": url, "pageTitle": page_title, "caller": caller, "actor": actor}
+        return self._call("browser.report", params, [])
 
 @_snake_case_hints
 class TextApi:
@@ -703,6 +860,7 @@ class TextApi:
 
 class GeneratedApi:
     def __init__(self, call: Callable[[str, dict[str, Any], list[str]], Any]) -> None:
+        self.surface = SurfaceApi(call)
         self.system = SystemApi(call)
         self.app = AppApi(call)
         self.board = BoardApi(call)
@@ -716,9 +874,10 @@ class GeneratedApi:
         self.relay = RelayApi(call)
         self.events = EventsApi(call)
         self.client = ClientApi(call)
+        self.browser = BrowserApi(call)
         self.text = TextApi(call)
 
-METHODS = ["system.ping","app.metrics","board.get","board.history","board.list","board.open","board.open_remote","board.export","object.get","object.find","object.create","object.update","object.upsert","object.delete","object.measure","object.reload","object.batch","layout.place","layout.stack","layout.translate","layout.grid","layout.check","tray.list","tray.stage","tray.unstage","tray.drain","tray.commit","agent.report","agent.report_session","agent.release","agent.list","agent.prompt","agent.wait","agent.read","agent.inbox","agent.restart","follow.report","view.attention","view.get","view.open_url","view.render","view.snapshot","session.spawn","session.list","session.kill","relay.open","events.subscribe","client.attach","text.measure"]
+METHODS = ["surface.stream","surface.ack","surface.input","surface.answer","surface.stop","system.ping","app.metrics","app.update","board.get","board.undo","board.redo","board.history","board.list","board.open","board.open_remote","board.close","board.export","object.get","object.find","object.create","object.update","object.upsert","object.delete","object.measure","object.reload","object.batch","layout.place","layout.stack","layout.translate","layout.grid","layout.check","tray.list","tray.stage","tray.unstage","tray.drain","tray.commit","agent.report","agent.report_session","agent.release","agent.list","agent.prompt","agent.wait","agent.read","agent.inbox","agent.restart","follow.report","view.seen","view.attention","view.get","view.open_url","view.render","view.snapshot","session.spawn","session.list","session.kill","relay.open","events.subscribe","client.attach","client.list","browser.call","browser.report","text.measure"]
 
 # Reads the client re-sends when the connection drops after sending (the app restarted), with `timeoutMs` reduced by the time already spent.
 RESEND_METHODS = ["agent.wait"]

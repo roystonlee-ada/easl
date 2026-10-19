@@ -15,6 +15,7 @@ public enum BoardEvent: Sendable {
     case followUpdated(tile: ObjectID, follow: ObjectID)
     /// A marker raised or replaced (`attention`), or removed (nil).
     case attentionChanged(object: ObjectID, attention: Attention?)
+    case composer(ComposerNotice)
 
     public var name: String {
         switch self {
@@ -25,9 +26,9 @@ public enum BoardEvent: Sendable {
         case .agentLifecycle: "agent.lifecycle"
         case .followUpdated: "follow.updated"
         case .attentionChanged: "attention.changed"
+        case .composer(let notice): notice.kind.rawValue
         }
     }
-
     public var data: JSONValue {
         switch self {
         case .objectCreated(let object), .objectUpdated(let object):
@@ -42,6 +43,7 @@ public enum BoardEvent: Sendable {
             .object(["tile": .string(tile), "follow": .string(follow)])
         case .attentionChanged(let id, let attention):
             attention?.json ?? .object(["id": .string(id), "active": .bool(false)])
+        case .composer(let notice): notice.json
         }
     }
 }
@@ -114,8 +116,9 @@ public final class Board {
     /// The composer's prompts to each terminal, oldest first, each waiting for the drain of the
     /// text it typed (`queueComposerPrompt`, Composer.swift); in memory only.
     public internal(set) var composerPrompts: [ObjectID: [ComposerPrompt]] = [:]
-    /// Mentions the composer sent to a terminal that never took them (its agent went, the
-    /// prompt expired) are staged again: the terminal, and the tray's mentions for them.
+    var composerNotices: [ComposerNotice] = []
+    public internal(set) var composerReceipts: [ComposerNotice] = []
+    var seenForwarded: [ObjectID: Int] = [:]
     public var onComposerMentionsReturned: ((ObjectID, [Mention]) -> Void)?
     /// Each terminal's last answer: the final assistant message of its agent's last finished
     /// turn, as its integration reported it with `idle` (`agent.read` `final`). A new turn clears
@@ -177,12 +180,36 @@ public final class Board {
     /// Per terminal, the code tile its last ⌘-click opened or re-aimed and that tile's `rev`
     /// then (`openCode`); in memory only.
     var codePreviews: [ObjectID: (tile: ObjectID, rev: Int)] = [:]
-    /// The pending check for the earliest open question's `expiresAt` (Question.swift).
+    /// The pending check for the earliest open question's `expiresAt` or closed one's `archiveAt` (Question.swift).
     var questionExpiry: DispatchWorkItem?
+    /// The `archiveAfter` a new question that names none gets (`questionToCreate`): its host's
+    /// setting, given by the registry that opened it (`BoardRegistry.open`); in memory, never saved.
+    var defaultQuestionArchiveAfter = QuestionSpec.defaultArchiveAfter
+    public private(set) var isClosed = false
+
+    func deactivate() {
+        isClosed = true
+        questionExpiry?.cancel()
+        questionExpiry = nil
+        onChange = nil
+        onEvent = nil
+        onTerminalsEnded = nil
+        onMessagesBounced = nil
+        viewport = { nil }
+        arrowPath = nil
+        settleArrows = nil
+        settledRouting = nil
+        pageElements = nil
+        terminalLabel = nil
+        terminalScreen = nil
+        terminalBlockIndex = nil
+        onHostRekey = nil
+    }
 
     public var onEvent: ((BoardEvent) -> Void)?
     /// Content changes by anyone, for ⌘Z; see UndoHistory.
     public let history = UndoHistory()
+    var viewerHistories = ViewerHistories()
     /// Who did what, for `board.history` (in memory; see ActivityLog).
     public let activity = ActivityLog()
     /// Set while a change's own entry is written by its caller (follow re-aims).
@@ -245,12 +272,24 @@ public final class Board {
     public let isRemote: Bool
     /// Where a remote board's writes go.
     weak var host: BoardHost?
+    /// Why the user's undos and restacks on a remote board can't reach its host (an easl too old
+    /// to keep this viewer's history); nil when they can, and on a board of this app's own.
+    public var hostHistoryUnavailable: String? { isRemote ? host?.historyUnavailable : nil }
     /// A remote board's provisional object (first) is about to become the host's (second):
     /// whoever shows it carries what the user had going on it (`rekeyHost`).
     public var onHostRekey: ((_ provisional: ObjectID, _ host: ObjectID) -> Void)?
     /// How deep the user's write calls are nested on a remote board: only the outermost one goes
     /// to the host (its cascades, a group re-fit or an arrow detaching, are the host's to make).
     private var hostWriteDepth = 0
+    /// Browser pages on Mac-hosted boards execute on that host, including imported objects.
+    public var hostMachine: DrawingMachine? {
+        didSet {
+            guard !isRemote, let hostMachine else { return }
+            for object in objects.values.sorted(by: { $0.id < $1.id }) where object.type == .browser && DrawingMachine(object.props)?.id != hostMachine.id {
+                commitBookkeeping(object, props: .object(["drawingMachine": hostMachine.json]))
+            }
+        }
+    }
 
     public init(id: BoardID, root: URL) {
         self.id = id
@@ -259,7 +298,7 @@ public final class Board {
     }
 
     /// An empty remote board (`BoardMirror` fills it with `applyHost`).
-    init(remote id: BoardID, root: URL, host: BoardHost) {
+    init(remote id: BoardID, root: URL, host: BoardHost?) {
         self.id = id
         self.root = root
         isRemote = true
@@ -343,6 +382,15 @@ public final class Board {
 
     @discardableResult
     public func create(type: ObjectType, props: JSONValue, frame: Frame? = nil, parent: ObjectID? = nil, caller: ObjectID? = nil) -> CanvasObject {
+        guard isRemote, hostWriteDepth == 0 else { return creating(type: type, props: props, frame: frame, parent: parent, caller: caller) }
+        return stepping { step in
+            let object = creating(type: type, props: props, frame: frame, parent: parent, caller: caller)
+            host?.send(.create(object, step: step))
+            return object
+        }
+    }
+
+    private func creating(type: ObjectType, props: JSONValue, frame: Frame?, parent: ObjectID?, caller: ObjectID?) -> CanvasObject {
         let size: (w: Double, h: Double)
         if type == .question {
             size = QuestionSpec.size(props)
@@ -353,9 +401,10 @@ public final class Board {
             size = Self.defaultSize(type)
         }
         let z = (objects.values.map(\.z).max() ?? 0) + 1
-        // A remote board's terminal is stamped by its host, which knows its checkouts.
+        var stamped = type == .terminal && !isRemote ? stampingWorktree(props) : props
+        if type == .browser, !isRemote, let hostMachine { stamped = props.merging(.object(["drawingMachine": hostMachine.json])) }
         var object = CanvasObject(id: IDs.make("obj"), type: type, frame: frame ?? Frame(x: 0, y: 0, w: size.w, h: size.h), z: z, parent: parent, createdBy: Actor(caller: caller), createdAt: Date(),
-                                  props: type == .terminal && !isRemote ? stampingWorktree(props) : props)
+                                  props: stamped)
         if let fitted = fittedFrame(ofGroup: object) {
             object.frame = fitted
         } else if frame == nil {
@@ -366,7 +415,6 @@ public final class Board {
         history.record(.created(object), by: object.createdBy)
         log(.created, object, actor: ActivityActor(caller: caller), "created \(ActivityLog.describe(object)) at \(ActivityLog.position(reported(object).frame))")
         onEvent?(.objectCreated(object))
-        if isRemote, hostWriteDepth == 0 { host?.send(.create(object)) }
         return object
     }
 
@@ -378,10 +426,12 @@ public final class Board {
     public func update(_ id: ObjectID, rev: Int? = nil, frame: Frame? = nil, z: Double? = nil, props: JSONValue? = nil, caller: ObjectID? = nil, actor: ActivityActor? = nil) throws -> CanvasObject {
         if isRemote {
             if actor == .system { return try object(id) }
-            let seen = objects[id]?.rev
-            let object = try toHost { try write(id, rev: rev, frame: frame, z: z, props: props, caller: caller, actor: actor, refitting: []) }
-            if hostWriteDepth == 0 { host?.send(.update(id, seen: seen, frame: frame, z: z, props: props)) }
-            return object
+            return try stepping { step in
+                let seen = objects[id]?.rev
+                let object = try toHost { try write(id, rev: rev, frame: frame, z: z, props: props, caller: caller, actor: actor, refitting: []) }
+                if hostWriteDepth == 0 { host?.send(.update(id, step: step, seen: seen, frame: frame, z: z, props: props)) }
+                return object
+            }
         }
         if actor == .system { return try unrecorded { try write(id, rev: rev, frame: frame, z: z, props: props, caller: caller, actor: actor, refitting: []) } }
         return try write(id, rev: rev, frame: frame, z: z, props: props, caller: caller, actor: actor, refitting: [])
@@ -409,20 +459,48 @@ public final class Board {
         commitBookkeeping(before, props: props)
     }
 
-    /// A code tile's range re-found by content (`NoteAnchor`, from the tile's reload of its
-    /// file) and the first line it is anchored by, written like `writeBookkeeping`: the app keeps
-    /// the range on the code it showed, nobody chose to move it, so no `rev`, undo step, or log.
-    /// Only a code tile whose range anchors (`CodeAnchor.fence`).
-    public func reanchor(_ id: ObjectID, range: LineRange, anchor: String?) throws {
+    /// A page's committed URL or title, credited to its driver. Remote observations preview
+    /// their props without advancing the object's revision.
+    public func reportPage(_ id: ObjectID, _ report: BrowserReport) throws {
+        if isRemote {
+            var shown = try object(id)
+            let props: JSONValue = switch report {
+            case .url(let url, _): .object(["url": .string(url)])
+            case .title(let title): .object(["pageTitle": title.map(JSONValue.string) ?? .null])
+            }
+            shown.props = shown.props.merging(props)
+            applyHost(shown)
+            if hostWriteDepth == 0 { host?.send(.page(id, report)) }
+            return
+        }
+        switch report {
+        case .url(let url, let actor):
+            let caller: ObjectID? = if case .agent(let tile) = actor { tile } else { nil }
+            _ = try update(id, props: .object(["url": .string(url)]), caller: caller, actor: actor)
+        case .title(let title):
+            try writeBookkeeping(id, props: .object(["pageTitle": title.map(JSONValue.string) ?? .null]))
+        }
+    }
+
+    /// Re-finds a code range using an authorized read, not text supplied by a display tile.
+    /// Like bookkeeping, relocation changes no object rev, undo step, or activity log.
+    @discardableResult
+    public func reanchor(_ id: ObjectID, captured: [String]? = nil) async throws -> NoteExcerpt? {
         let before = try object(id)
         guard before.type == .code, CodeAnchor.fence(before.props) != nil else {
             throw BoardError.invalidParams("only a code tile showing a range, not a follow tile or pinned to a commit, is re-anchored")
         }
-        commitBookkeeping(before, props: .object(["range": range.json, "anchor": anchor.map(JSONValue.string) ?? .null]))
+        guard !isRemote, !Task.isCancelled else { return nil }
+        let excerpt = await CodeAnchor.excerpt(props: before.props, boardRoot: root, captured: captured)
+        guard !Task.isCancelled, objects[id] == before else { return nil }
+        if let excerpt, let range = excerpt.range, !excerpt.refused {
+            let anchor = CodeAnchor.anchor(of: LineRange(start: 1, end: 1), in: excerpt.lines)
+            commitBookkeeping(before, props: .object(["range": range.json, "anchor": anchor.map(JSONValue.string) ?? .null]))
+        }
+        return excerpt
     }
 
     func commitBookkeeping(_ before: CanvasObject, props: JSONValue) {
-        // A remote board's bookkeeping is its host's.
         guard !isRemote else { return }
         var object = before
         object.props = object.props.merging(props)
@@ -484,8 +562,10 @@ public final class Board {
     /// exactly what was recorded. On a remote board the delete is a preview sent to the host.
     public func delete(_ id: ObjectID, caller: ObjectID? = nil) throws {
         guard isRemote, hostWriteDepth == 0 else { return try deleting(id, caller: caller) }
-        try toHost { try deleting(id, caller: caller) }
-        host?.send(.delete(id))
+        try stepping { step in
+            try toHost { try deleting(id, caller: caller) }
+            host?.send(.delete(id, step: step))
+        }
     }
 
     private func deleting(_ id: ObjectID, caller: ObjectID?) throws {
@@ -627,6 +707,7 @@ public final class Board {
         history.end()
         guard !history.isOpen else { return }
         flushBounces()
+        flushComposerNotices()
         guard !removedTerminals.isEmpty else { return }
         let ended = removedTerminals.filter { objects[$0.id] == nil }
         removedTerminals = []
@@ -643,6 +724,8 @@ public final class Board {
         history.begin()
         let mark = history.mark()
         let (handed, queued, named) = (handoffs, messages, aliases)
+        let prompts = composerPrompts
+        let notices = composerNotices
         defer {
             endStep()
             if outermost { pinnedRevision = nil }
@@ -660,6 +743,8 @@ public final class Board {
             handoffs = handed
             messages = queued
             aliases = named
+            composerPrompts = prompts
+            composerNotices = notices
             throw error
         }
     }
@@ -694,6 +779,7 @@ public final class Board {
     /// directory keep the default size.
     public func newCodeSize(_ props: JSONValue) -> (w: Double, h: Double) {
         let size = Self.defaultSize(.code)
+        guard !isRemote else { return size }
         guard let aim = CodeAim(props: props), aim.ref == nil, aim.pinnedCommit == nil, props["followOf"]?.string == nil else { return size }
         let url = absoluteURL(aim.path).resolvingSymlinksInPath()
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
@@ -1078,6 +1164,10 @@ public final class Board {
     /// the user deleted it meanwhile (the delete follows to the host).
     func rekeyHost(_ provisional: ObjectID, as object: CanvasObject) {
         guard var shown = objects[provisional] else { return }
+        if let preview = codePreviews.first(where: { $0.value.tile == provisional }) {
+            codePreviews[preview.key] = preview.value.rev == shown.rev ? (object.id, object.rev) : nil
+        }
+        if let preview = codePreviews.removeValue(forKey: provisional) { codePreviews[object.id] = preview }
         onHostRekey?(provisional, object.id)
         removeHost(provisional)
         shown.id = object.id
@@ -1244,9 +1334,17 @@ public final class Board {
     /// The user has looked at this terminal; a `done` agent becomes `idle`. Looking at an agent
     /// that is still working (or waiting on an approval) doesn't count: its answer isn't there
     /// yet, so a turn that ends after the user looked away stays `done` until they look again.
-    /// A remote board's agents are seen on their host (v1: looking here changes nothing there).
     public func markSeen(_ tile: ObjectID) {
-        guard !isRemote, let terminal = objects[tile], terminal.type == .terminal, !seenSinceWorking.contains(tile) else { return }
+        guard let terminal = objects[tile], terminal.type == .terminal else { return }
+        if isRemote {
+            let state = terminal.props["lifecycle"]?["state"]?.string
+            guard state == LifecycleState.done.rawValue || state == LifecycleState.idle.rawValue else { return }
+            guard seenForwarded[tile] != terminal.rev else { return }
+            seenForwarded[tile] = terminal.rev
+            host?.send(.seen(tile, rev: terminal.rev, marker: nil))
+            return
+        }
+        guard !seenSinceWorking.contains(tile) else { return }
         let state = terminal.props["lifecycle"]?["state"]?.string
         guard state != LifecycleState.working.rawValue, state != LifecycleState.blocked.rawValue else { return }
         seenSinceWorking.insert(tile)
@@ -1522,7 +1620,13 @@ public final class Board {
     /// through a symlink: git, language servers and shells report resolved paths (/private/tmp
     /// for a /tmp root), so a path outside the root as written is compared resolved as well.
     public func relativePath(_ path: String) -> String {
-        Self.relativePath(path, root: root)
+        isRemote ? Self.hostRelativePath(path, root: root.path) : Self.relativePath(path, root: root)
+    }
+
+    nonisolated static func hostRelativePath(_ path: String, root: String) -> String {
+        let absolute = hostPath(path, under: root)
+        let base = hostPath(root, under: "/")
+        return absolute.hasPrefix(base + "/") ? String(absolute.dropFirst(base.count + 1)) : absolute
     }
 
     /// `path` (absolute, or relative to `root`) relative to `root` when it lies under it, else absolute.

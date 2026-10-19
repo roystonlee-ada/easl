@@ -1,0 +1,540 @@
+import Foundation
+
+public struct HostFileRequest: Sendable, Equatable {
+    public enum Source: Sendable, Equatable {
+        case directory(String)
+        case liveRoot(ref: String, boardRoot: String)
+        case ref(String, lastKnownSha: String?, boardRoot: String)
+    }
+
+    public enum Policy: Sendable, Equatable {
+        case boardFile(String)
+        case boardImage(String)
+        case pageImage(relative: String?, absolute: String?, temps: [String])
+    }
+
+    public var source: Source
+    public var policy: Policy
+    public var bytes: Bool
+
+    public init(source: Source, policy: Policy, bytes: Bool = true) {
+        self.source = source
+        self.policy = policy
+        self.bytes = bytes
+    }
+}
+
+public struct HostFileVersion: Sendable, Equatable {
+    public var root: String
+    public var path: String?
+    public var commit: String?
+    public var stamp: String?
+
+    public init(root: String, path: String? = nil, commit: String? = nil, stamp: String? = nil) {
+        self.root = root
+        self.path = path
+        self.commit = commit
+        self.stamp = stamp
+    }
+}
+
+public enum HostFileObservation: Sendable, Equatable {
+    case version(HostFileVersion)
+    case failure(HostFileError)
+}
+
+public struct HostFile: Sendable, Equatable {
+    public var root: String
+    public var path: String?
+    public var commit: String?
+    public var data: Data
+    public var stamp: String?
+    public var version: HostFileVersion { HostFileVersion(root: root, path: path, commit: commit, stamp: stamp) }
+
+    public init(root: String, path: String?, commit: String?, data: Data, stamp: String? = nil) {
+        self.root = root
+        self.path = path
+        self.commit = commit
+        self.data = data
+        self.stamp = stamp
+    }
+
+    public var mimeType: String { HtmlKit.mimeType(URL(fileURLWithPath: path ?? "")) }
+}
+
+public enum HostFileError: Error, Equatable, Sendable {
+    case refused
+    case notFound(commit: String?)
+    case tooLarge(limit: Int)
+    case unreadable
+    case ref(String)
+    case unavailable(String)
+}
+
+extension HostFileError {
+    init(code: String?, message: String?, commit: String? = nil, limit: Int? = nil) {
+        switch code {
+        case "refused": self = .refused
+        case "not_found": self = .notFound(commit: commit)
+        case "too_large": self = .tooLarge(limit: limit ?? SourceExcerpt.maxFileBytes)
+        case "unreadable": self = .unreadable
+        case "ref": self = .ref(message ?? "unknown ref")
+        default: self = .unavailable(message ?? "host file read failed")
+        }
+    }
+}
+
+struct HostProgram: Sendable {
+    fileprivate let frame: Data
+
+    init(_ source: String) {
+        var frame = try! JSONEncoder().encode(source)
+        frame.append(0x0a)
+        self.frame = frame
+    }
+}
+
+public struct HostFiles: Sendable {
+    public let hostName: String
+    public let temps: [String]
+    private let route: HostRoute
+    private let master: HostMaster?
+    private let channelRoute: HostRoute
+    private let channelMaster: HostMaster?
+
+    @MainActor
+    public init(host: RemoteHost, master: HostMaster) {
+        hostName = host.name
+        temps = [host.tmpdir, "/tmp", "/var/tmp"]
+        let reader = master.fileReader
+        route = reader.route
+        self.master = reader
+        channelRoute = master.route
+        channelMaster = master
+    }
+
+    init(hostName: String, route: HostRoute, temps: [String]) {
+        self.hostName = hostName
+        self.route = route
+        self.temps = temps
+        master = nil
+        channelRoute = route
+        channelMaster = nil
+    }
+
+    /// This host without its master, for cleanup while easl quits: nothing it runs waits for
+    /// the master, a file-session slot or the main actor.
+    var cleanup: HostFiles { HostFiles(hostName: hostName, route: channelRoute, temps: temps) }
+
+    public func read(_ request: HostFileRequest) async throws -> HostFile {
+        let output = try await execute(Self.program, request: payload(request), retryTransport: true, what: "host file reader")
+        guard let reply = try? JSONDecoder().decode(Reply.self, from: Data(output.utf8)) else {
+            throw HostFileError.unavailable("invalid host file reply")
+        }
+        guard reply.ok else {
+            throw HostFileError(code: reply.code, message: reply.message, commit: reply.commit, limit: reply.limit)
+        }
+        guard let root = reply.root, let encoded = reply.data, let bytes = Data(base64Encoded: encoded) else {
+            throw HostFileError.unavailable("invalid host file bytes")
+        }
+        return HostFile(root: root, path: reply.path, commit: reply.commit, data: bytes, stamp: reply.stamp)
+    }
+
+    func execute(_ program: HostProgram, request: Data, timeout: TimeInterval = 20, retryTransport: Bool = false, what: String) async throws -> String {
+        let input = program.frame + request
+        var attempt = 0
+        while true {
+            attempt += 1
+            try Task.checkCancellation()
+            var admitted = false
+            let interrupt: (@Sendable () -> Void)?
+            do {
+                if let master {
+                    try await master.fileSession()
+                    admitted = true
+                    try await master.ready()
+                    interrupt = try await master.interruption()
+                } else {
+                    interrupt = nil
+                }
+            } catch is CancellationError {
+                if admitted, let master { await master.endFileSession() }
+                throw CancellationError()
+            } catch {
+                if admitted, let master { await master.endFileSession() }
+                try Task.checkCancellation()
+                let failure = error as? HostMaster.Failure
+                if retryTransport, failure?.retryable == true, attempt < 3 {
+                    try await Task.sleep(for: .milliseconds(150 * attempt))
+                    continue
+                }
+                let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                throw HostFileError.unavailable(Self.sshRefused(message) ? "the host refused the SSH connection" : message)
+            }
+            let result: RemoteHost.RunResult
+            do {
+                result = try await RemoteHost.run(route.executable, route.ssh(Self.command), input: input, timeout: timeout, timeoutPolicy: .inactivity, onStop: interrupt)
+            } catch {
+                if let master { await master.endFileSession() }
+                throw error
+            }
+            if result.status != 0, Self.retryableSSHFailure(status: result.status, errors: result.errors) { interrupt?() }
+            if let master { await master.endFileSession() }
+            try Task.checkCancellation()
+            if result.timedOut {
+                NSLog("easl: %@ on %@ timed out after %ld reply bytes (status %d): %@", what, hostName, result.output.utf8.count, result.status, result.errors)
+                throw HostFileError.unavailable("the host stopped responding for \(String(format: "%g", timeout)) seconds")
+            }
+            if result.status == 0 { return result.output }
+            NSLog("easl: %@ on %@ failed (status %d): %@", what, hostName, result.status, result.errors)
+            if retryTransport, Self.retryableSSHFailure(status: result.status, errors: result.errors), attempt < 3 {
+                try await Task.sleep(for: .milliseconds(150 * attempt))
+                continue
+            }
+            let reason: String
+            if Self.sshRefused(result.errors) {
+                reason = "the host refused the SSH connection"
+            } else {
+                reason = RemoteHost.lastLine(result.errors)
+                    ?? (result.status == 255 ? "the SSH connection to \(hostName) ended unexpectedly" : "\(what) exited with status \(result.status)")
+            }
+            throw HostFileError.unavailable(reason)
+        }
+    }
+
+    private static let permanentSSHFailures = [
+        "permission denied", "authentication failed", "host key verification failed",
+        "remote host identification has changed", "bad configuration", "no matching host key type",
+        "no matching key exchange method", "no supported authentication methods",
+        "too many authentication failures", "bad owner or permissions", "invalid format",
+        "could not resolve hostname", "hostname contains invalid characters", "unknown option",
+        "illegal option", "cannot execute proxycommand",
+    ]
+
+    static func retryableSSHFailure(status: Int32, errors: String) -> Bool {
+        let message = errors.lowercased()
+        guard !permanentSSHFailures.contains(where: message.contains) else { return false }
+        return status == 255 || sshRefusedLowercased(message)
+    }
+
+    static func sshRefused(_ message: String) -> Bool {
+        sshRefusedLowercased(message.lowercased())
+    }
+
+    private static func sshRefusedLowercased(_ message: String) -> Bool {
+        return (message.contains("ssh: connect to host ") && message.contains("connection refused"))
+            || (message.contains("mux_client_request_session:") && message.contains("refused"))
+            || (message.contains("channel ") && message.contains("open failed:")
+                && (message.contains("refused") || message.contains("administratively prohibited")))
+    }
+
+    func channel(_ script: String, _ arguments: [String]) async throws -> (executable: String, arguments: [String]) {
+        do {
+            try await channelMaster?.ready()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw HostFileError.unavailable((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+        }
+        return (channelRoute.executable, channelRoute.ssh(HostedTerminal.remote(script, arguments)))
+    }
+
+    private struct Reply: Decodable {
+        var ok: Bool
+        var root: String?
+        var path: String?
+        var commit: String?
+        var stamp: String?
+        var data: String?
+        var code: String?
+        var message: String?
+        var limit: Int?
+    }
+
+    func sourcePayload(_ value: HostFileRequest.Source) throws -> [String: JSONValue] {
+        var source: [String: JSONValue]
+        switch value {
+        case .directory(let root): source = ["kind": .string("directory"), "root": .string(root)]
+        case .liveRoot(let ref, let root): source = ["kind": .string("live"), "root": .string(root), "ref": .string(ref)]
+        case .ref(let ref, let sha, let root):
+            source = ["kind": .string("ref"), "root": .string(root), "ref": .string(ref)]
+            if let sha, NoteSource.isRevision(sha) { source["sha"] = .string(sha) }
+        }
+        if let ref = source["ref"]?.string, !NoteSource.isRevision(ref) {
+            if source["kind"] == .string("live") { source = ["kind": .string("directory"), "root": source["root"]!] }
+            else { throw HostFileError.ref("\"\(ref)\" is not a ref") }
+        }
+        return source
+    }
+
+    private func payload(_ request: HostFileRequest) throws -> Data {
+        let source = try sourcePayload(request.source)
+        let policy: JSONValue
+        switch request.policy {
+        case .boardFile(let relative):
+            policy = .object(["kind": .string("board"), "relative": .string(try HtmlKit.boardRelative(relative))])
+        case .boardImage(let path):
+            policy = .object(["kind": .string("boardImage"), "path": .string(path)])
+        case .pageImage(let relative, let absolute, let temps):
+            policy = .object(["kind": .string("image"), "relative": relative.map(JSONValue.string) ?? .null,
+                              "absolute": absolute.map(JSONValue.string) ?? .null, "temps": .array(temps.map(JSONValue.string))])
+        }
+        let value = JSONValue.object(["source": .object(source), "policy": policy, "bytes": .bool(request.bytes)])
+        return try JSONEncoder().encode(value)
+    }
+
+    private static let launcher = #"""
+    for b in "$(command -v bun)" "$HOME/.bun/bin/bun" /opt/homebrew/bin/bun /usr/local/bin/bun; do
+      if [ -n "$b" ] && [ -x "$b" ]; then exec "$b" -e "$1"; fi
+    done
+    echo "bun isn't installed on the host" >&2
+    exit 127
+    """#
+
+    /// Every program runs through this one short command, reading itself and its request from
+    /// stdin: a long command fails over the ssh master (`mm_send_fd: sendmsg(2): Message too long`).
+    private static let command = HostedTerminal.remote(launcher, [loader])
+
+    private static let loader = #"const frame = await Bun.stdin.text(); const split = frame.indexOf("\n"); const req = JSON.parse(frame.slice(split + 1)); const script = JSON.parse(frame.slice(0, split)); await new (Object.getPrototypeOf(async function(){}).constructor)("req", "require", script)(req, require);"#
+
+    static let prelude = #"""
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const cp = require('node:child_process');
+    const fail = (code, extra = {}) => { throw { code, ...extra }; };
+    const real = p => { try { return fs.realpathSync(p); } catch { return null; } };
+    const resolved = p => {
+      const found = real(p);
+      if (found) return found;
+      const parent = path.dirname(p);
+      return parent === p ? p : path.join(resolved(parent), path.basename(p));
+    };
+    const inside = (dir, p) => dir === '/' || p === dir || p.startsWith(dir + '/');
+    const git = (dir, args, max = 1048576) => {
+      try {
+        return cp.execFileSync('git', ['-C', dir, ...args], {
+          env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_NO_LAZY_FETCH: '1' },
+          timeout: 20000, maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe']
+        });
+      } catch (e) {
+        if (e.code === 'ENOENT' || e.code === 'ETIMEDOUT') fail('unavailable', { message: 'git is unavailable' });
+        if (e.code === 'ENOBUFS') fail('too_large', { limit: max });
+        return null;
+      }
+    };
+    const text = (dir, args) => git(dir, args)?.toString('utf8').trim() || null;
+    const commitOf = (dir, ref) => text(dir, ['rev-parse', '--verify', '--quiet', '--end-of-options', ref + '^{commit}']);
+    function boardAreas(boardRoot) {
+      const lex = path.resolve(boardRoot), areas = [{ lex, real: resolved(lex) }];
+      const top = text(lex, ['rev-parse', '--show-toplevel']);
+      if (!top) return areas;
+      const place = path.relative(real(top) || top, areas[0].real);
+      if (place === '..' || place.startsWith('../') || path.isAbsolute(place)) return areas;
+      for (const block of (text(top, ['worktree', 'list', '--porcelain', '-z']) || '').split('\0\0')) {
+        const lines = block.split('\0'), entry = lines.find(l => l.startsWith('worktree '))?.slice(9);
+        if (!entry || lines.some(l => l.startsWith('prunable')) || !real(entry)) continue;
+        const canonical = path.join(real(entry), place);
+        const aliases = [path.join(entry, place), path.resolve(lex, path.relative(areas[0].real, canonical))];
+        for (const area of aliases) {
+          if (resolved(area) === canonical && !areas.some(a => a.lex === area)) areas.push({ lex: area, real: canonical });
+        }
+      }
+      return areas;
+    }
+    function resolveSource(source) {
+      const root = path.resolve(source.root);
+      if (source.kind === 'directory') return { root };
+      const top = text(root, ['rev-parse', '--show-toplevel']);
+      if (!top) {
+        if (source.kind === 'live') return { root };
+        fail('ref', { message: 'not in a git repository' });
+      }
+      const place = path.relative(real(top) || top, real(root) || root);
+      const branch = source.ref.replace(/^refs\/heads\//, '');
+      const listing = text(top, ['worktree', 'list', '--porcelain', '-z']) || '';
+      for (const block of listing.split('\0\0')) {
+        const lines = block.split('\0');
+        const entry = lines.find(l => l.startsWith('worktree '))?.slice(9);
+        if (!entry || lines.some(l => l.startsWith('prunable')) || !real(entry)) continue;
+        if (!lines.includes('branch refs/heads/' + branch)) continue;
+        const counterpart = path.join(entry, place);
+        if (resolved(counterpart) !== path.join(real(entry), place)) fail('refused');
+        if (source.kind === 'live') return { root: path.join(entry, place) };
+        const sha = commitOf(entry, 'HEAD');
+        if (sha) return { root: path.join(entry, place), state: 'live', sha, worktree: entry };
+      }
+      if (source.kind === 'live') return { root };
+      let sha = commitOf(top, source.ref);
+      if (sha) return { root, commit: sha, state: 'objects', sha };
+      sha = source.sha && commitOf(top, source.sha);
+      if (!sha) fail('ref', { message: 'unknown ref ' + source.ref });
+      let branchName = text(top, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'])?.replace(/^refs\/remotes\//, '');
+      if (!branchName) {
+        for (const name of ['main', 'master']) {
+          if (git(top, ['show-ref', '--verify', '--quiet', 'refs/heads/' + name]) !== null) { branchName = name; break; }
+        }
+      }
+      const tip = branchName && commitOf(top, branchName);
+      if (tip && git(top, ['merge-base', '--is-ancestor', sha, tip]) !== null) {
+        if (sha === tip) return { root, commit: sha, state: 'merged', sha, merge: sha };
+        const first = text(top, ['rev-list', '--first-parent', '--ancestry-path', '--reverse', '--parents', sha + '..' + tip])?.split('\n')[0]?.split(' ');
+        if (first?.length) {
+          const merge = first[1] === sha ? sha : first[0];
+          return { root, commit: merge, state: 'merged', sha, merge };
+        }
+      }
+      return { root, commit: sha, state: 'missing', sha };
+    }
+    const reader = String.raw`
+    import base64
+    import errno
+    import hashlib
+    import json
+    import os
+    import stat
+    import sys
+
+    def read_regular(request, budget):
+        directory = None
+        fd = None
+        try:
+            p = os.path.normpath(request['path'])
+            if not any(d == '/' or p == d or p.startswith(d + '/') for d in request['roots']):
+                return {'ok': False, 'code': 'refused'}
+            capability = getattr(os, 'O_SEARCH', getattr(os, 'O_PATH', None))
+            if capability is None or os.open not in os.supports_dir_fd:
+                return {'ok': False, 'code': 'unavailable', 'message': 'Python3 descriptor-relative file access is unavailable'}
+            flags = capability | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = os.open('/', flags)
+            components = p.split('/')[1:]
+            for component in components[:-1]:
+                previous = directory
+                directory = None
+                try:
+                    directory = os.open(component, flags, dir_fd=previous)
+                finally:
+                    os.close(previous)
+            fd = os.open(components[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return {'ok': False, 'code': 'not_found'}
+            stamp = ':'.join(str(value) for value in (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+            executable = bool(st.st_mode & 0o111)
+            limit = request['limit']
+            if limit is not None and st.st_size > limit and (request['bytes'] or request['metadataLimit']):
+                return {'ok': False, 'code': 'too_large', 'limit': limit}
+            if not request['bytes'] or request.get('stamp') == stamp:
+                return {'ok': True, 'path': p, 'stamp': stamp, 'exec': executable, 'size': st.st_size, 'data': ''}
+            if budget is not None and st.st_size > budget[0]:
+                return {'ok': False, 'code': 'too_large', 'limit': limit}
+            with os.fdopen(fd, 'rb', closefd=False) as stream:
+                data = stream.read() if limit is None else stream.read(limit + 1)
+            if limit is not None and len(data) > limit:
+                return {'ok': False, 'code': 'too_large', 'limit': limit}
+            if request.get('digest'):
+                return {'ok': True, 'path': p, 'stamp': stamp, 'exec': executable, 'sha256': hashlib.sha256(data).hexdigest()}
+            if budget is not None:
+                if len(data) > budget[0]:
+                    return {'ok': False, 'code': 'too_large', 'limit': limit}
+                budget[0] -= len(data)
+            return {'ok': True, 'path': p, 'stamp': stamp, 'exec': executable, 'size': len(data), 'data': base64.b64encode(data).decode('ascii')}
+        except OSError as error:
+            code = 'refused' if error.errno in (errno.ELOOP, errno.ENOTDIR) else 'not_found' if error.errno == errno.ENOENT else 'unreadable'
+            return {'ok': False, 'code': code}
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+            finally:
+                if directory is not None:
+                    os.close(directory)
+
+    batch = json.loads(sys.stdin.read())
+    budget = None if batch.get('budget') is None else [batch['budget']]
+    print(json.dumps([read_regular(request, budget) for request in batch['requests']]))
+    `;
+    function readFiles(requests, budget = null) {
+      if (!requests.length) return [];
+      const result = cp.spawnSync('python3', ['-I', '-S', '-B', '-c', reader], {
+        input: JSON.stringify({ requests, budget }), encoding: 'utf8', maxBuffer: Infinity, stdio: ['pipe', 'pipe', 'pipe']
+      });
+      if (result.error?.code === 'ENOENT') fail('unavailable', { message: 'python3 is required for secure host file reads but is not installed on the host' });
+      if (result.error || result.status !== 0) fail('unavailable', { message: 'Python3 host descriptor reader failed' });
+      let replies;
+      try { replies = JSON.parse(result.stdout); }
+      catch { fail('unavailable', { message: 'invalid host descriptor reply' }); }
+      if (!Array.isArray(replies) || replies.length !== requests.length) fail('unavailable', { message: 'invalid host descriptor reply' });
+      return replies;
+    }
+
+    """#
+
+    private static let program = HostProgram(prelude + #"""
+    const source = req.source, policy = req.policy;
+    function readRegular(p, root, roots, limit) {
+      return { root, ...readFiles([{ path: p, roots, bytes: req.bytes, limit, metadataLimit: policy.kind === 'boardImage' }])[0] };
+    }
+    function read() {
+      const { root, commit } = resolveSource(source);
+      if (policy.kind === 'board') {
+        const rel = policy.relative;
+        if (!rel || rel.includes('\0') || rel.startsWith('/') || rel.startsWith('~') || rel.split('/').includes('..')) fail('refused');
+        const base = resolved(root), candidate = resolved(path.join(root, rel));
+        if (candidate === base || !inside(base, candidate)) fail('refused');
+        if (commit) {
+          if (!req.bytes) return { ok: true, root, path: rel, commit, data: '' };
+          const data = git(root, ['show', '--end-of-options', commit + ':./' + rel], \#(NoteSource.maxOutput));
+          if (data === null) fail('not_found', { commit });
+          return { ok: true, root, path: rel, commit, data: data.toString('base64') };
+        }
+        const p = real(candidate);
+        if (!p) fail('not_found');
+        return readRegular(p, root, [base], \#(SourceExcerpt.maxFileBytes));
+      }
+      if (policy.kind === 'boardImage') {
+        let input = policy.path;
+        if (typeof input !== 'string' || !input || input.includes('\0') || input.startsWith('~')) fail('refused');
+        if (input.startsWith('file:')) {
+          try { input = require('node:url').fileURLToPath(input); }
+          catch { fail('refused'); }
+        } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) fail('refused');
+        if (input.includes('\0')) fail('refused');
+        const requested = path.resolve(root, input);
+        if (requested === root || !inside(root, requested)) fail('refused');
+        if (commit) {
+          const rel = path.relative(root, requested);
+          if (!req.bytes) {
+            const size = text(root, ['cat-file', '-s', commit + ':./' + rel]);
+            if (size === null) fail('not_found', { commit });
+            if (Number(size) > \#(SourceExcerpt.maxFileBytes)) fail('too_large', { limit: \#(SourceExcerpt.maxFileBytes) });
+            return { ok: true, root, path: rel, commit, data: '' };
+          }
+          const data = git(root, ['show', '--end-of-options', commit + ':./' + rel], \#(SourceExcerpt.maxFileBytes));
+          if (data === null) fail('not_found', { commit });
+          return { ok: true, root, path: rel, commit, data: data.toString('base64') };
+        }
+        const base = resolved(root), candidate = resolved(requested);
+        if (candidate === base || !inside(base, candidate)) fail('refused');
+        const p = real(candidate);
+        if (!p) fail('not_found');
+        return readRegular(p, root, [base], \#(SourceExcerpt.maxFileBytes));
+      }
+      const extensions = new Set(\#(String(decoding: try! JSONEncoder().encode(LocalImage.extensions.sorted()), as: UTF8.self)));
+      const dirs = [root, ...policy.temps].map(d => real(d) || path.resolve(d));
+      const allowed = p => p && extensions.has(path.extname(p).slice(1).toLowerCase()) && dirs.some(d => inside(d, p));
+      if (policy.relative != null) {
+        const p = real(path.resolve(root, policy.relative));
+        if (allowed(p)) return readRegular(p, root, dirs, null);
+      }
+      if (policy.absolute == null) fail('refused');
+      const p = real(policy.absolute);
+      if (!p) fail('not_found');
+      if (!allowed(p)) fail('refused');
+      return readRegular(p, root, dirs, null);
+    }
+    let reply;
+    try { reply = read(); }
+    catch (e) { reply = { ok: false, code: e.code || 'unreadable', message: e.message, commit: e.commit, limit: e.limit }; }
+    process.stdout.write(JSON.stringify(reply));
+    """#)
+}

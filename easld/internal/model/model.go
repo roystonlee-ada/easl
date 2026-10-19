@@ -128,14 +128,14 @@ func (t ObjectType) IsTile() bool {
 func (t ObjectType) KnownProps() []string {
 	own := map[ObjectType][]string{
 		Terminal: {"cwd", "command", "zmxSession", "host", "title", "name", "agent", "lifecycle", "follow", "zoom", "worktree", "branch"},
-		Browser:  {"url", "title", "pageTitle", "zoom", "profile", "reloadOnChange"},
+		Browser:  {"url", "urlIntent", "title", "pageTitle", "drawingMachine", "zoom", "profile", "reloadOnChange"},
 		Code:     {"path", "range", "anchor", "symbol", "caption", "diffBase", "followOf", "lastAction", "lastChanges", "history", "pinnedCommit", "ref", "refSha", "zoom"},
 		Note:     {"markdown", "title", "root", "ref", "refSha", "zoom"},
 		HTML:     {"html", "title", "root", "ref", "refSha", "allowNetwork", "state", "zoom"},
 		Changes:  {"root", "base", "head", "ref", "refSha", "paths", "title", "reviewed", "viewed", "zoom"},
 		Image:    {"path", "caption", "title"},
 		Diagram:  {"kind", "path", "symbol", "line", "direction", "depth", "expanded", "title", "graph", "zoom"},
-		Question: {"question", "options", "recommended", "context", "asker", "status", "expiresAt", "answer", "archived", "zoom"},
+		Question: {"question", "options", "recommended", "context", "asker", "status", "expiresAt", "answer", "archived", "keep", "archiveAfter", "zoom"},
 		Shape:    {"kind", "text", "points", "color", "fill", "textSize"},
 		Arrow:    {"from", "to", "relation", "label", "color", "route"},
 		Group:    {"members", "title", "color", "padding", "flow"},

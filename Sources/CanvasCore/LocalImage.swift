@@ -28,26 +28,13 @@ public enum LocalImage {
     /// after symlinks resolve, with an image extension. Nil for anything else (other schemes,
     /// `..` escapes, files elsewhere on disk).
     public static func sandboxed(_ source: String, root: URL, tempDirectories: [String] = FollowFilter.tempDirectories) -> URL? {
-        let decoded = source.removingPercentEncoding ?? source
-        guard !decoded.isEmpty, !decoded.contains("\0") else { return nil }
-        let candidate: URL
-        if let url = URL(string: source), let scheme = url.scheme {
-            guard scheme == "file" else { return nil }
-            candidate = url
-        } else if decoded.hasPrefix("/") {
-            candidate = URL(fileURLWithPath: decoded)
-        } else {
-            guard !decoded.hasPrefix("~") else { return nil }
-            candidate = root.appendingPathComponent(decoded)
-        }
-        guard let resolved = confined(candidate, root: root, tempDirectories: tempDirectories),
+        guard let path = candidate(source, root: root.path),
+              let resolved = confined(URL(fileURLWithPath: path), root: root, tempDirectories: tempDirectories),
               extensions.contains(resolved.pathExtension.lowercased()) else { return nil }
         return resolved
     }
 
-    /// `file` with `..` and symlinks resolved, when that is inside the board root or a temp
-    /// directory (resolved too); nil anywhere else. `sandboxed` and a terminal's ⌘-clicked page
-    /// (`Board.referencePage`) share it.
+    /// Returns the resolved file only inside the resolved root or a temp directory.
     public static func confined(_ file: URL, root: URL, tempDirectories: [String] = FollowFilter.tempDirectories) -> URL? {
         let resolved = file.standardizedFileURL.resolvingSymlinksInPath()
         let allowed = [root.path] + tempDirectories
@@ -63,27 +50,60 @@ public enum LocalImage {
         return sandboxed(requestPath, root: root)
     }
 
+    static func candidate(_ source: String, root: String) -> String? {
+        let decoded = source.removingPercentEncoding ?? source
+        guard !decoded.isEmpty, !decoded.contains("\0") else { return nil }
+        if let url = URL(string: source), let scheme = url.scheme {
+            guard scheme == "file" else { return nil }
+            return url.path
+        }
+        if decoded.hasPrefix("/") { return decoded }
+        guard !decoded.hasPrefix("~") else { return nil }
+        return root + "/" + decoded
+    }
+
+    public static func hostPageFile(requestPath: String, source: HostFileRequest.Source, temps: [String]) -> HostFileRequest? {
+        let relative = String(requestPath.drop(while: { $0 == "/" }))
+        let relativePath = candidate(relative, root: "/")
+        let absolute = candidate(requestPath, root: "/")
+        guard relativePath != nil || absolute != nil else { return nil }
+        return HostFileRequest(source: source, policy: .pageImage(
+            relative: relativePath.map { String($0.drop(while: { $0 == "/" })) },
+            absolute: absolute, temps: temps))
+    }
+
     /// Natural size in points: one point per pixel for bitmaps (a 1280×960 chart is 1280×960 pt),
     /// the document size for SVG and a PDF's first page. Reads only the header of a bitmap. Nil when
     /// the file isn't a readable image. Blocking: call off the main thread.
     nonisolated public static func naturalSize(of url: URL) -> CGSize? {
         let type = url.pathExtension.lowercased()
-        if type != "svg", type != "pdf", let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-           let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-           let width = properties[kCGImagePropertyPixelWidth] as? Double, let height = properties[kCGImagePropertyPixelHeight] as? Double,
-           width > 0, height > 0 {
-            // EXIF orientations 5–8 are rotated a quarter turn.
-            let rotated = ((properties[kCGImagePropertyOrientation] as? Int) ?? 1) >= 5
-            return rotated ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
-        }
+        if type != "svg", type != "pdf", let size = bitmapSize(CGImageSourceCreateWithURL(url as CFURL, nil)) { return size }
         guard let data = try? Data(contentsOf: url), let image = NSImage(data: data), image.size.width > 0, image.size.height > 0 else { return nil }
         return image.size
+    }
+
+    /// The natural size of image bytes, without a file or cache. Bitmap pixels ignore DPI;
+    /// SVG and the first PDF page retain their document size. Blocking: call off the main thread.
+    nonisolated public static func naturalSize(of data: Data) -> CGSize? {
+        if let size = bitmapSize(CGImageSourceCreateWithData(data as CFData, nil)) { return size }
+        guard let image = NSImage(data: data), image.size.width > 0, image.size.height > 0 else { return nil }
+        return image.size
+    }
+
+    nonisolated private static func bitmapSize(_ source: CGImageSource?) -> CGSize? {
+        guard let source,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Double,
+              let height = properties[kCGImagePropertyPixelHeight] as? Double,
+              width > 0, height > 0 else { return nil }
+        let orientation = (properties[kCGImagePropertyOrientation] as? Int) ?? 1
+        return (5...8).contains(orientation) ? CGSize(width: height, height: width) : CGSize(width: width, height: height)
     }
 
     /// The file's bytes and natural size, read off the main thread. Nil when unreadable.
     public static func read(_ url: URL) async -> (data: Data, size: CGSize)? {
         await offPool {
-            guard let data = try? Data(contentsOf: url), let size = naturalSize(of: url) else { return nil }
+            guard let data = try? Data(contentsOf: url), let size = naturalSize(of: data) else { return nil }
             return (data, size)
         }
     }

@@ -20,12 +20,14 @@ import (
 // app did when they were recorded. The test fails when one of them stops passing; a scenario
 // that starts passing is reported, so it can join the list.
 var passing = []string{
-	"agent-control", "agent-control-owned", "agents", "arrows", "batch", "board-get-history", "boards", "client-delegation", "client-failures", "client-mode", "client-versions",
+	"agent-control", "agent-control-owned", "agents", "app-update-daemon", "app-update-validation", "arrows", "batch", "board-close", "board-close-owned", "board-get-history", "board-lifecycle", "boards", "browser-drawing", "client-delegation", "client-failures", "client-mode", "client-versions",
 	"code-tiles", "events", "follow-attention", "groups", "keys-upsert-find", "layout", "layout-check", "messages",
-	"metrics", "no-client", "objects-crud", "open-url", "owned-terminals", "placement", "protocol", "questions", "tray",
+	"metrics", "no-client", "objects-crud", "open-url", "owned-terminals", "placement", "protocol", "question-cleanup", "questions", "remote-attention", "remote-composer", "remote-undo", "tray", "viewer-serve",
 }
 
 // Not passing, and why:
+//   - browser-surfaces: frames and native input belong to the Mac app's WKWebView.
+//     easld returns unsupported until it relays surface sessions between attached clients.
 //   - measure-notes: recorded against the app, whose AppKit measured its notes and text shapes
 //     exactly (SF Pro, TextKit 2; Shantell Sans with GPOS kerning). With no client attached easld
 //     measures them from the glyph table (measure/glyphs): within a few points, and marked
@@ -34,7 +36,7 @@ var passing = []string{
 // owning are the scenarios replayed against an easld that owns its boards' terminals
 // (--own-terminals), with a zmx that runs no session (zmxtest); the rest run against one in its
 // default mode (an easld on a Mac, where the app runs its terminals): no zmx, no ownership.
-var owning = map[string]bool{"owned-terminals": true, "agent-control-owned": true}
+var owning = map[string]bool{"owned-terminals": true, "agent-control-owned": true, "board-close-owned": true}
 
 // The suite replayed against easld in-process: a fresh home, the real router and socket server,
 // in the mode each scenario needs (owning).

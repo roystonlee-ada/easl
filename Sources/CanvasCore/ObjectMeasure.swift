@@ -34,6 +34,9 @@ public enum ObjectMeasure {
     /// of an HTML tile's page with these props laid out `width` points wide, `<canvas-code>`
     /// excerpts read against `root`. Nil in CanvasCore alone, where HTML is `unsupported`.
     public static var html: ((_ props: JSONValue, _ width: CGFloat, _ root: URL) async throws -> CGSize)?
+    /// What lays an HTML tile's page out: the document extent of the page with these props laid
+    /// out `width` points wide (`html` reading one root, or a remote board's viewer reading its host).
+    public typealias PageMeasurer = (_ props: JSONValue, _ width: CGFloat) async throws -> CGSize
 
     /// `width` wraps notes and text (a note defaults to a new note's width; text defaults to
     /// one unwrapped line per paragraph); for code it is the widest the frame may get (default
@@ -57,9 +60,7 @@ public enum ObjectMeasure {
             guard let spec = ShapeSpec(props) else { throw Failure.invalidParams("shape props need a kind") }
             return try shape(spec, width: width.map { CGFloat($0) })
         case .html:
-            // `width` wide (what the page wraps at), as tall as the document up to the cap.
-            let extent = try await htmlExtent(props, width: width, root: root)
-            return CGSize(width: CGFloat(width ?? Board.defaultSize(.html).w), height: min(extent.height, CGFloat(maxHtmlFitHeight)))
+            return try await htmlSize(props, width: width, page: page(root: root))
         case .changes:
             // The rows of every changed file, as wide as the longest line up to `width`.
             let set = await ChangeSet.load(root: root, spec: ChangesSpec(props), highlight: false)
@@ -90,15 +91,31 @@ public enum ObjectMeasure {
         return ObjectZoom.zoomed(size, zoom: zoom)
     }
 
+    /// An HTML tile's frame: `width` wide (what the page wraps at; default a new HTML tile's), as
+    /// tall as `htmlExtent` up to `maxHtmlFitHeight`.
+    public static func htmlSize(_ props: JSONValue, width: Double?, page: PageMeasurer) async throws -> CGSize {
+        let extent = try await htmlExtent(props, width: width, page: page)
+        return CGSize(width: CGFloat(width ?? Board.defaultSize(.html).w), height: min(extent.height, CGFloat(maxHtmlFitHeight)))
+    }
+
     /// The frame an HTML tile needs to show its whole document with the page laid out `width`
     /// canvas points wide (default a new HTML tile's width) at `width / zoom`: as wide as that or
     /// the document's scroll width, as tall as the title bar plus the document, uncapped.
     public static func htmlExtent(_ props: JSONValue, width: Double?, root: URL) async throws -> CGSize {
-        guard let html else { throw Failure.unsupported("html objects are measured by the app's WebKit") }
+        try await htmlExtent(props, width: width, page: page(root: root))
+    }
+
+    private static func htmlExtent(_ props: JSONValue, width: Double?, page: PageMeasurer) async throws -> CGSize {
         let zoom = ObjectZoom.of(props)
         let natural = CGFloat(width ?? Board.defaultSize(.html).w) / zoom
-        let document = try await html(props, natural, root)
+        let document = try await page(props, natural)
         return ObjectZoom.zoomed(CGSize(width: max(natural, document.width.rounded(.up)), height: CGFloat(RenderMath.tileTitleHeight) + document.height.rounded(.up)), zoom: zoom)
+    }
+
+    /// `html` reading `root`.
+    private static func page(root: URL) throws -> PageMeasurer {
+        guard let html else { throw Failure.unsupported("html objects are measured by the app's WebKit") }
+        return { props, width in try await html(props, width, root) }
     }
 
     /// The lines a code tile shows fitted: its `range` (what the tile scrolls to and tints; a
@@ -174,6 +191,12 @@ public enum ObjectMeasure {
         let document = NoteMarkdown.parse(props["markdown"]?.string ?? "")
         let excerpts = await NoteSource.excerpts(for: NoteMarkdown.anchoredFences(in: document), root: root)
         let images = await NoteImages.load(NoteImages.sources(in: document), root: root)
+        return note(document, width: width, excerpts: excerpts, images: images)
+    }
+
+    /// `note(_:width:root:)` once its fences' `excerpts` (by fence key) and its `images` (by
+    /// destination) are read.
+    static func note(_ document: Document, width: CGFloat?, excerpts: [String: NoteExcerpt], images: [String: NSImage]) -> (size: CGSize, tableShortfall: CGFloat) {
         let width = width ?? defaultNoteWidth
         let textWidth = width - 2 * noteInset.width
         let renderer = NoteRenderer(excerpts: excerpts, images: images, width: textWidth)
@@ -203,14 +226,12 @@ public enum ObjectMeasure {
         let text = spec.text ?? ""
         switch spec.kind {
         case .text:
-            let label = DrawingStyle.text(text, size: DrawingStyle.textPointSize * spec.textSize, color: .labelColor)
-            let bounds = textBounds(label, width: width)
+            let bounds = shapeTextBounds(text, textSize: spec.textSize, width: width)
             return CGSize(width: width ?? bounds.width, height: bounds.height)
         case .rect, .ellipse:
             // The label wraps 16 points inside the frame (DrawnItem.shape) and sits centered.
-            let label = DrawingStyle.text(text, size: DrawingStyle.labelSize, color: .labelColor, alignment: .center)
             let inner = width.map { $0 - 16 - shapeLabelPadding.width }
-            let bounds = textBounds(label, width: inner)
+            let bounds = labelBounds(text, width: inner)
             let box = CGSize(width: (inner ?? bounds.width) + 16 + shapeLabelPadding.width, height: bounds.height + 2 * shapeLabelPadding.height)
             guard spec.kind == .ellipse else { return box }
             let scale = 2.0.squareRoot()
@@ -224,6 +245,17 @@ public enum ObjectMeasure {
     static func textBounds(_ text: NSAttributedString, width: CGFloat?) -> CGSize {
         let size = text.boundingRect(with: NSSize(width: width ?? .greatestFiniteMagnitude, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin]).size
         return CGSize(width: ceil(size.width) + 2, height: ceil(size.height) + 2)
+    }
+
+    /// A text shape's text at `textSize` times the drawing's text size, wrapped at `width` or
+    /// unwrapped (`textBounds`).
+    static func shapeTextBounds(_ text: String, textSize: CGFloat, width: CGFloat?) -> CGSize {
+        textBounds(DrawingStyle.text(text, size: DrawingStyle.textPointSize * textSize, color: .labelColor), width: width)
+    }
+
+    /// A rect's or an ellipse's label, centered, wrapped at `width` or unwrapped (`textBounds`).
+    static func labelBounds(_ text: String, width: CGFloat?) -> CGSize {
+        textBounds(DrawingStyle.text(text, size: DrawingStyle.labelSize, color: .labelColor, alignment: .center), width: width)
     }
 }
 
