@@ -148,6 +148,27 @@ func (f *fixture) result(method string, params map[string]any) map[string]any {
 	return reply["result"].(map[string]any)
 }
 
+func TestBoardGetReportsMergedBoardOwnersOnlyWhenPresent(t *testing.T) {
+	f := newFixture(t)
+	for _, repo := range []*store.RepoRecord{nil, {CommonDir: "/repo/.git"}, {CommonDir: "/repo/.git", Merged: []string{}}} {
+		f.board.Repo = repo
+		got := f.result("board.get", map[string]any{})
+		if got["board"] != f.board.ID() {
+			t.Fatalf("board = %v, want %s", got["board"], f.board.ID())
+		}
+		if _, present := got["merged"]; present {
+			t.Fatalf("empty merge history must be omitted: %v", got)
+		}
+	}
+	f.board.Repo = &store.RepoRecord{CommonDir: "/repo/.git", Merged: []string{"brd_old", "brd_second"}}
+	for _, params := range []map[string]any{{}, {"board": "brd_old", "branch": "main"}} {
+		got := f.result("board.get", params)
+		if got["board"] != f.board.ID() || !reflect.DeepEqual(got["merged"], []string{"brd_old", "brd_second"}) {
+			t.Fatalf("manifest = %v, want current board and [brd_old brd_second]", got)
+		}
+	}
+}
+
 func errorOf(reply map[string]any) (string, string) {
 	e, _ := reply["error"].(map[string]any)
 	code, _ := e["code"].(string)
@@ -173,6 +194,28 @@ func (f *fixture) found(key string) string {
 		return ""
 	}
 	return idOf(reply["result"].(map[string]any))
+}
+
+func TestHTMLMeasurementNeedsAnApp(t *testing.T) {
+	f := newFixture(t)
+	id := idOf(f.result("object.create", map[string]any{
+		"type": "html", "props": map[string]any{"html": "<p>Hello</p>"},
+		"frame": map[string]any{"x": 0.0, "y": 0.0, "w": 400.0, "h": 300.0},
+	}))
+	for _, call := range []struct {
+		method string
+		params map[string]any
+	}{
+		{"object.measure", map[string]any{"type": "html", "props": map[string]any{"html": "<p>Hello</p>"}}},
+		{"object.create", map[string]any{"type": "html", "props": map[string]any{"html": "<p>Hello</p>"}, "size": "fit"}},
+		{"object.upsert", map[string]any{"type": "html", "key": "html", "props": map[string]any{"html": "<p>Hello</p>"}, "size": "fit"}},
+		{"object.update", map[string]any{"id": id, "size": "fit"}},
+	} {
+		code, message := errorOf(f.call(call.method, call.params))
+		if code != "unavailable" || message != "an html page is measured by the app" {
+			t.Errorf("%s: %s: %s", call.method, code, message)
+		}
+	}
 }
 
 func TestUnknownAndMissingParamsNameWhatTheMethodTakes(t *testing.T) {

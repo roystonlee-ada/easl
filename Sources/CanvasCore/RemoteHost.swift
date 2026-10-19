@@ -13,31 +13,43 @@ public struct RemoteHost: Codable, Hashable, Sendable {
     public var sshTarget: String
     /// The host's easl socket.
     public var socketPath: String
-    /// The host's GUI session TMPDIR, where zmx keeps its sessions; an ssh session's differs on
-    /// a Mac (`getconf DARWIN_USER_TEMP_DIR` finds the GUI's).
+    /// The host's temporary directory. A Mac app's zmx uses its GUI session's TMPDIR,
+    /// found with `getconf DARWIN_USER_TEMP_DIR`, rather than an ssh session's.
     public var tmpdir: String
     /// The host's `easl` CLI.
     public var easlBin: String
     /// The host's zmx: a non-interactive ssh session's PATH may lack Homebrew's directory.
     public var zmxBin: String
-    /// The app bundle that owns `socketPath`, which `startCommand` opens; nil when the viewer
-    /// can't tell (a development instance's launcher isn't discoverable) or the host isn't a Mac.
+    /// The server's zmx directory; nil for the installed Mac app, which uses the GUI TMPDIR.
+    public var zmxDir: String?
+    /// The app bundle that owns `socketPath`, which `startCommand` opens; nil for identified
+    /// easld, a development instance's unknown launcher, or a non-Mac host.
     public var appBundle: String?
     /// The host's `nc` shuts its socket down at the end of its stdin with `-N` (OpenBSD's and
     /// FreeBSD's; Apple's `-N` takes a probe count). Without it `nc -U` outlives a closed stdin, so
     /// a relay the viewer ended could stay on the host.
     public var ncShutdown: Bool
+    /// Discovery's guess from the host's OS, resolved on the board's link before its window
+    /// opens (`identified`). Nil for a host remembered before easl recorded the server.
+    /// App hosts answer delegated calls themselves; easld takes viewers as clients.
+    public var server: Server?
+
+    public enum Server: String, Codable, Sendable {
+        case app, easld
+    }
 
     public init(name: String, sshTarget: String, socketPath: String, tmpdir: String, easlBin: String, zmxBin: String = "zmx",
-                appBundle: String? = nil, ncShutdown: Bool = false) {
+                appBundle: String? = nil, ncShutdown: Bool = false, zmxDir: String? = nil, server: Server? = nil) {
         self.name = name
         self.sshTarget = sshTarget
         self.socketPath = socketPath
         self.tmpdir = tmpdir
         self.easlBin = easlBin
         self.zmxBin = zmxBin
+        self.zmxDir = zmxDir
         self.appBundle = appBundle
         self.ncShutdown = ncShutdown
+        self.server = server
     }
 
     /// The ssh client every remote command runs: `/usr/bin/ssh`, or `EASL_DEV_SSH` (a wrapper
@@ -59,18 +71,51 @@ public struct RemoteHost: Codable, Hashable, Sendable {
         ["-T"] + Self.batchOptions + [sshTarget, "nc", "-U"] + (ncShutdown ? ["-N"] : []) + [Self.quote(socketPath)]
     }
 
-    /// Exit status of `terminalAttachCommand` when the host has no such session (yet).
-    public static let noSessionStatus: Int32 = 75
+    /// Runs a script with the same GUI temporary directory as this host's terminals.
+    public func scriptArguments(_ script: String, _ args: [String]) -> [String] {
+        ["-T"] + Self.batchOptions + [sshTarget, "env", Self.quote("TMPDIR=" + tmpdir), HostedTerminal.remote(script, args)]
+    }
 
-    /// The command a terminal tile runs to show the host's zmx session `session`. It attaches
-    /// only to a session that exists, else exits `noSessionStatus`: `zmx attach` creates a
-    /// missing one (a bare shell without labels), and the host's own tile attaching later would
-    /// find it and never run its agent.
-    public func terminalAttachCommand(session: String) -> [String] {
-        let zmx = Self.quote(zmxBin)
-        let script = "\(zmx) get \"$1\" >/dev/null 2>&1 || { echo \"no session $1 yet\" >&2; exit \(Self.noSessionStatus); }; exec \(zmx) attach \"$1\""
-        return [Self.ssh, "-t", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3", sshTarget,
-                "env", "TMPDIR=" + Self.quote(tmpdir), "sh", "-c", Self.quote(script), "sh", Self.quote(session)]
+    /// The session runs on `props.host` when hosted, otherwise on the board host. Its owner is
+    /// always the board host's home, with this tile and a current or merged board label.
+    public func terminalAttachCommand(for terminal: CanvasObject, board: BoardID, merged: [BoardID]) -> [String] {
+        let tile = terminal.id
+        let home = HostedTerminal.homeLabel((socketPath as NSString).deletingLastPathComponent)
+        let target: String
+        let command: String
+        if let hosted = HostedTerminal.host(of: terminal) {
+            if let problem = Self.problem(withHost: hosted) {
+                return ["/bin/sh", "-c", #"printf '%s\r\n' "$1"; exec sleep 2147483647"#,
+                        "easl-remote", "Not attaching: \(problem)"]
+            }
+            target = hosted
+            command = HostedTerminal.attach(session: "canvas-" + tile, home: home, board: board, tile: tile, merged: merged)
+        } else {
+            target = sshTarget
+            let setup = "export TMPDIR=\(Self.quote(tmpdir))\n"
+                + (zmxDir.map { "export ZMX_DIR=\(Self.quote($0))\n" } ?? "")
+                + "z=\(Self.quote(zmxBin))"
+            command = HostedTerminal.ownershipAttach(session: "canvas-" + tile, home: home,
+                                                    board: board, tile: tile, merged: merged, setup: setup)
+        }
+        return [Self.ssh, "-t"] + Self.batchOptions + [target, command]
+    }
+
+    /// Retries transport failures and ended sessions until the viewer disposes the surface.
+    /// An ownership refusal holds the notice without retrying or repainting it.
+    public static func terminalCommand(_ attach: [String]) -> String {
+        let loop = #"""
+        while :; do
+          "$@"
+          case $? in
+            \#(HostedTerminal.refused)) exec sleep 2147483647 ;;
+            0) sleep 1; continue ;;
+          esac
+          printf '\r\033[2K[easl] waiting for the host…'
+          sleep 2
+        done
+        """#
+        return ShellWords.quote(["/bin/sh", "-c", loop, "easl-remote"] + attach)
     }
 
     /// Starts the easl whose socket `socketPath` is, without bringing it forward there. Needs a
@@ -81,18 +126,54 @@ public struct RemoteHost: Codable, Hashable, Sendable {
         return [Self.ssh, "-T"] + Self.batchOptions + [sshTarget, "open", "-g", Self.quote(appBundle)]
     }
 
+    /// easl's socket in its home `home` on a host.
+    public static func socketPath(home: String) -> String { home + "/easl.sock" }
+
+    /// easl's home on the host, where `discover` given it as `support` finds this socket again;
+    /// nil for a socket that isn't `socketPath(home:)`'s, which discovery never answers.
+    public var home: String? {
+        let name = Self.socketPath(home: "")
+        return socketPath.hasSuffix(name) ? String(socketPath.dropLast(name.count)) : nil
+    }
+
     // MARK: Discovery
 
     /// Asks the host where its socket, GUI TMPDIR, easl and zmx are, in one ssh call. `support`
-    /// replaces the host's easl support directory (`EASL_DEV_REMOTE_HOME`: a development
-    /// instance on the host, docs/testing.md). Throws `unavailable` with ssh's reason when the
-    /// host can't be reached, and `CancellationError` (ssh ended) when the calling task is cancelled.
-    public static func discover(name: String, sshTarget: String, support: String? = nil, timeout: TimeInterval = 20) async throws -> RemoteHost {
+    /// replaces the host's easl home: `EASL_DEV_REMOTE_HOME` (a development instance on the host,
+    /// docs/testing.md) or a reopen-list board's (`RemoteReopen.support`). Throws `unavailable` with
+    /// ssh's reason when the host can't be reached, and `CancellationError` (ssh ended) when the
+    /// calling task is cancelled.
+    public static func discover(name: String, sshTarget: String, support: String? = nil, allowDefault: Bool = true, timeout: TimeInterval = 20) async throws -> RemoteHost {
         let result = try await run(ssh, ["-T"] + batchOptions + [sshTarget, "sh", "-c", quote(discoveryScript)], timeout: timeout)
-        guard result.status == 0, let host = parseDiscovery(result.output, name: name, sshTarget: sshTarget, support: support) else {
-            let reason = lastLine(result.errors) ?? (result.status == 0 ? "unexpected answer from \(sshTarget)" : "ssh exited with status \(result.status)")
+        guard result.status == 0, let host = parseDiscovery(result.output, name: name, sshTarget: sshTarget, support: support, allowDefault: allowDefault) else {
+            let reason = lastLine(result.errors) ?? (result.status == 0 ? "discovery refused or unexpected answer from \(sshTarget)\(allowDefault ? "" : "; the default easl server is disabled")" : "ssh exited with status \(result.status)")
             throw EaslConnection.Failure("unavailable", reason)
         }
+        return host
+    }
+
+    /// A Mac can run either server. Ask its live board link before choosing rendering and
+    /// attachment behavior; discovery must still work while the installed app is stopped.
+    public func identified(on connection: EaslConnection, timeout: Duration = .seconds(10)) async throws -> RemoteHost {
+        guard server == .app else { return self }
+        do {
+            let result = try await connection.request("client.list", timeout: timeout)
+            guard result["clients"]?.array != nil else {
+                throw ApiRouter.Failure("unavailable", "client.list on \(name) returned no clients list")
+            }
+        } catch let failure as EaslConnection.Failure {
+            switch failure.code {
+            case "unsupported", "invalid_params":
+                return self
+            default:
+                throw ApiRouter.Failure(failure.code == "timeout" ? "unavailable" : failure.code,
+                                        "couldn't identify the server on \(name): \(failure.message)")
+            }
+        }
+        var host = self
+        host.server = .easld
+        host.appBundle = nil
+        if host.zmxDir == nil, let home { host.zmxDir = home + "/zmx" }
         return host
     }
 
@@ -117,9 +198,11 @@ public struct RemoteHost: Codable, Hashable, Sendable {
 
     /// The host the discovery script's `output` describes: a Mac's easl lives in its app bundle
     /// and Application Support; elsewhere easld's home is `$XDG_STATE_HOME/easl`, else
-    /// `~/.local/state/easl`. A `support` directory is a development instance: its launcher isn't
-    /// known, so the host has no app bundle to start. Nil without a home or a TMPDIR.
-    public static func parseDiscovery(_ output: String, name: String, sshTarget: String, support: String? = nil) -> RemoteHost? {
+    /// `~/.local/state/easl`. A `support` directory is that home instead. On a Mac it is a
+    /// development instance: its launcher isn't known, so the host has no app bundle to start, and
+    /// its zmx is in the home (`zmx`, `tmp`) rather than the GUI TMPDIR. Nil without a home or a TMPDIR.
+    public static func parseDiscovery(_ output: String, name: String, sshTarget: String, support: String? = nil, allowDefault: Bool = true) -> RemoteHost? {
+        if let support, !isHome(support) { return nil }
         var values: [String: String] = [:]
         for line in output.split(whereSeparator: \.isNewline) {
             guard let equals = line.firstIndex(of: "=") else { continue }
@@ -127,10 +210,19 @@ public struct RemoteHost: Codable, Hashable, Sendable {
         }
         guard let home = values["home"], !home.isEmpty, let tmpdir = values["tmpdir"], !tmpdir.isEmpty else { return nil }
         let mac = values["os"] == "Darwin"
-        let directory = support ?? (mac ? home + "/Library/Application Support/Easl" : ((values["state"].flatMap { $0.isEmpty ? nil : $0 } ?? home + "/.local/state") + "/easl"))
+        let defaultDirectory = mac ? home + "/Library/Application Support/Easl" : ((values["state"].flatMap { $0.isEmpty ? nil : $0 } ?? home + "/.local/state") + "/easl")
+        let directory = support ?? defaultDirectory
+        let isDefault = (directory as NSString).standardizingPath == (defaultDirectory as NSString).standardizingPath
+        guard allowDefault || !isDefault else { return nil }
         let easl = mac ? macEaslBin : (values["easl"] ?? "easl")
-        return RemoteHost(name: name, sshTarget: sshTarget, socketPath: directory + "/easl.sock", tmpdir: tmpdir, easlBin: easl, zmxBin: values["zmx"] ?? "zmx",
-                          appBundle: mac && support == nil ? macApp : nil, ncShutdown: values["ncshutdown"] == "1")
+        let installedApp = mac && isDefault
+        return RemoteHost(name: name, sshTarget: sshTarget, socketPath: socketPath(home: directory), tmpdir: mac && !installedApp ? directory + "/tmp" : tmpdir,
+                          easlBin: easl, zmxBin: values["zmx"] ?? "zmx", appBundle: installedApp ? macApp : nil, ncShutdown: values["ncshutdown"] == "1",
+                          zmxDir: installedApp ? nil : directory + "/zmx", server: mac ? .app : .easld)
+    }
+
+    static func isHome(_ path: String) -> Bool {
+        path.hasPrefix("/") && !path.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
     }
 
     /// The installed easl app on a Mac.
@@ -163,13 +255,15 @@ public struct RemoteHost: Codable, Hashable, Sendable {
     public struct Candidate: Equatable, Sendable {
         public var name: String
         public var sshTarget: String
+        public var home: String?
         public var detail: String
         /// Reachable as far as the tailnet knows; a host it doesn't list counts as online.
         public var online: Bool
 
-        public init(name: String, sshTarget: String, detail: String, online: Bool) {
+        public init(name: String, sshTarget: String, detail: String, online: Bool, home: String? = nil) {
             self.name = name
             self.sshTarget = sshTarget
+            self.home = home
             self.detail = detail
             self.online = online
         }
@@ -186,47 +280,56 @@ public struct RemoteHost: Codable, Hashable, Sendable {
             var detail = "Mac, online"
             if macs.filter({ $0.name == peer.name }).count > 1 { detail += ", " + peer.sshTarget }
             if used.contains(peer.sshTarget) { detail += ", opened before" }
-            return Candidate(name: peer.name, sshTarget: peer.sshTarget, detail: detail, online: true)
+            return Candidate(name: peer.name, sshTarget: peer.sshTarget, detail: detail, online: true,
+                             home: recents.first { $0.sshTarget == peer.sshTarget }?.home)
         }
         for recent in recents where !macs.contains(where: { $0.sshTarget == recent.sshTarget }) {
             let peer = peers.first { $0.sshTarget == recent.sshTarget }
             rows.append(Candidate(name: recent.name, sshTarget: recent.sshTarget,
                                   detail: peer.map { $0.online ? "\($0.os), online, opened before" : "offline" } ?? "opened before",
-                                  online: peer?.online ?? true))
+                                  online: peer?.online ?? true, home: recent.home))
         }
         return rows
     }
 
     /// A host typed into File › Open Remote… (`user@host`, an ssh config alias, a tailnet name):
     /// ssh connects to it as typed, and it goes by its host part.
-    public static func typed(_ target: String) -> (name: String, sshTarget: String) {
-        (target.split(separator: "@").last.map(String.init) ?? target, target)
+    public static func typed(_ target: String) -> (name: String, sshTarget: String, home: String?) {
+        (target.split(separator: "@").last.map(String.init) ?? target, target, nil)
     }
 
     /// The host `text` names among File › Open Remote…'s rows (`candidates`), as
     /// `board.open_remote` takes it: the row whose ssh target it is, else the one row of that
     /// name, else `text` as an ssh host typed in (`typed`). Tailnet names aren't unique, so a
     /// name two rows have is `ambiguous`, naming their ssh targets.
-    public static func target(_ text: String, among rows: [Candidate]) throws -> (name: String, sshTarget: String) {
-        if let row = rows.first(where: { $0.sshTarget == text }) { return (row.name, row.sshTarget) }
+    public static func target(_ text: String, among rows: [Candidate]) throws -> (name: String, sshTarget: String, home: String?) {
+        if let row = rows.first(where: { $0.sshTarget == text }) { return (row.name, row.sshTarget, row.home) }
         let named = rows.filter { $0.name == text }
         guard named.count < 2 else {
             throw ApiRouter.Failure("ambiguous", "\(text) names \(named.count) hosts: \(named.map(\.sshTarget).joined(separator: ", ")); pass one of these ssh targets as host")
         }
-        return named.first.map { ($0.name, $0.sshTarget) } ?? typed(text)
+        return named.first.map { ($0.name, $0.sshTarget, $0.home) } ?? typed(text)
     }
 
-    /// Why `text` can't be a host File › Open Remote… connects to, or nil: a host is one word (a
-    /// tailnet name, an ssh config alias, `user@host`, both parts there), and one starting with
-    /// `-` would be an option to ssh.
+    private static let shellHostCharacters = CharacterSet(charactersIn: "\"'`$\\;&<>|(){}")
+
+    /// An ssh target must be one word, not an option, with both parts of `user@host` present.
+    /// Older ssh clients expand hostnames into shell commands in the user's ssh configuration.
     public static func problem(withHost text: String) -> String? {
         if text.isEmpty { return "host is empty: pass a tailnet name, an ssh config alias or user@host" }
         if text.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }) {
             return "host \(text.debugDescription) isn't one host: a tailnet name, an ssh config alias or user@host has no spaces"
         }
+        if text.rangeOfCharacter(from: shellHostCharacters) != nil {
+            return "host \(text.debugDescription) contains shell metacharacters"
+        }
         if text.hasPrefix("-") { return "host \(text) starts with -, which ssh would take for an option" }
-        if let at = text.lastIndex(of: "@"), at == text.startIndex || text.index(after: at) == text.endIndex {
-            return "host \(text) needs both parts of user@host"
+        if let at = text.lastIndex(of: "@") {
+            let host = text[text.index(after: at)...]
+            if at == text.startIndex || host.isEmpty {
+                return "host \(text) needs both parts of user@host"
+            }
+            if host.hasPrefix("-") { return "host \(text) has a host part starting with -" }
         }
         return nil
     }
@@ -246,42 +349,79 @@ public struct RemoteHost: Codable, Hashable, Sendable {
         text.split(whereSeparator: \.isNewline).last.map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
     }
 
-    /// Runs `executable` off the cooperative pool (it blocks on pipes), terminated after
-    /// `timeout`; stdin is empty. Cancelling the calling task ends and reaps the process and
-    /// throws `CancellationError`, also when the task was cancelled before the process started.
-    public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> (status: Int32, output: String, errors: String) {
+    public enum TimeoutPolicy: Sendable {
+        case elapsed
+        case inactivity
+    }
+
+    public struct RunResult: Sendable {
+        public let status: Int32
+        public let output: String
+        public let errors: String
+        public let timedOut: Bool
+    }
+
+    /// Runs blocking process I/O on dedicated threads so GCD can still service socket reads.
+    /// Timeout and cancellation end and reap the process, including a blocked stdin writer.
+    public static func run(_ executable: String, _ arguments: [String], input: Data? = nil, timeout: TimeInterval, timeoutPolicy: TimeoutPolicy = .elapsed, onStop: (@Sendable () -> Void)? = nil) async throws -> RunResult {
         try Task.checkCancellation()
-        let job = RunningProcess()
-        let result: (status: Int32, output: String, errors: String) = await withTaskCancellationHandler {
-            await offPool {
+        let job = RunningProcess(onStop: onStop)
+        let result: RunResult = await withTaskCancellationHandler {
+            let work: @Sendable () -> RunResult = {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: executable)
                 process.arguments = arguments
                 let output = Pipe(), errors = Pipe()
                 process.standardOutput = output
                 process.standardError = errors
-                process.standardInput = FileHandle.nullDevice
-                do {
-                    guard try job.launch(process) else { return (-1, "", "cancelled") }
-                } catch {
-                    return (-1, "", "cannot run \(executable): \(error.localizedDescription)")
+                let stdin = input.map { _ in Pipe() }
+                if let stdin {
+                    process.standardInput = stdin
+                } else {
+                    process.standardInput = FileHandle.nullDevice
                 }
-                let running = UncheckedBox(process)
-                let deadline = DispatchWorkItem { if running.value.isRunning { running.value.terminate() } }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+                do {
+                    guard try job.launch(process, timeout: timeout) else {
+                        return RunResult(status: -1, output: "", errors: "cancelled", timedOut: false)
+                    }
+                } catch {
+                    return RunResult(status: -1, output: "", errors: "cannot run \(executable): \(error.localizedDescription)", timedOut: false)
+                }
                 let stderr = Locked(Data())
                 let drained = DispatchGroup()
+                try? stdin?.fileHandleForReading.close()
+                if let stdin, let input {
+                    let writer = stdin.fileHandleForWriting
+                    _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+                    drained.enter()
+                    Thread.detachNewThread {
+                        try? writer.write(contentsOf: input)
+                        try? writer.close()
+                        drained.leave()
+                    }
+                }
                 drained.enter()
-                DispatchQueue.global().async {
+                Thread.detachNewThread {
                     let data = errors.fileHandleForReading.readDataToEndOfFile()
                     stderr.withLock { $0 = data }
                     drained.leave()
                 }
-                let stdout = output.fileHandleForReading.readDataToEndOfFile()
+                var stdout = Data()
+                while true {
+                    let chunk = output.fileHandleForReading.availableData
+                    if chunk.isEmpty { break }
+                    if case .inactivity = timeoutPolicy { job.progress() }
+                    stdout.append(chunk)
+                }
                 drained.wait()
                 process.waitUntilExit()
-                deadline.cancel()
-                return (process.terminationStatus, String(decoding: stdout, as: UTF8.self), String(decoding: stderr.withLock { $0 }, as: UTF8.self))
+                let timedOut = job.finish()
+                return RunResult(status: process.terminationStatus, output: String(decoding: stdout, as: UTF8.self), errors: String(decoding: stderr.withLock { $0 }, as: UTF8.self), timedOut: timedOut)
+            }
+            return await withCheckedContinuation { done in
+                let thread = Thread { done.resume(returning: work()) }
+                thread.qualityOfService = .userInitiated
+                thread.start()
             }
         } onCancel: {
             job.cancel()
@@ -295,25 +435,76 @@ public struct RemoteHost: Codable, Hashable, Sendable {
 /// before the process starts keeps it from starting.
 private final class RunningProcess: @unchecked Sendable {
     private let lock = NSLock()
+    private let onStop: (@Sendable () -> Void)?
     private var process: Process?
     private var isCancelled = false
+    private var timedOut = false
+    private var timer: DispatchSourceTimer?
+    private var timeout: TimeInterval = 0
+    private var lastProgress = DispatchTime.now()
+
+    init(onStop: (@Sendable () -> Void)?) {
+        self.onStop = onStop
+    }
 
     var cancelled: Bool { lock.withLock { isCancelled } }
 
-    /// Starts `process` unless cancelled first (false then).
-    func launch(_ process: Process) throws -> Bool {
+    func launch(_ process: Process, timeout: TimeInterval) throws -> Bool {
         try lock.withLock {
             guard !isCancelled else { return false }
             try RemoteProcesses.shared.launch(process)
             self.process = process
+            self.timeout = timeout
+            lastProgress = .now()
+            let timer = DispatchSource.makeTimerSource(queue: .global())
+            timer.setEventHandler { [weak self] in self?.expire() }
+            timer.schedule(deadline: lastProgress + timeout)
+            self.timer = timer
+            timer.resume()
             return true
+        }
+    }
+
+    func progress() {
+        lock.withLock {
+            lastProgress = .now()
+        }
+    }
+
+    private func expire() {
+        lock.withLock {
+            guard !isCancelled, !timedOut, let process else { return }
+            let deadline = lastProgress + timeout
+            if DispatchTime.now() < deadline {
+                timer?.schedule(deadline: deadline)
+                return
+            }
+            timedOut = true
+            timer?.cancel()
+            timer = nil
+            RemoteProcesses.stop(process)
+            onStop?()
+        }
+    }
+
+    func finish() -> Bool {
+        lock.withLock {
+            timer?.cancel()
+            timer = nil
+            process = nil
+            return timedOut
         }
     }
 
     func cancel() {
         lock.withLock {
             isCancelled = true
-            if let process { RemoteProcesses.stop(process) }
+            timer?.cancel()
+            timer = nil
+            if let process {
+                RemoteProcesses.stop(process)
+                onStop?()
+            }
         }
     }
 }

@@ -3,7 +3,7 @@ import CanvasCore
 
 /// One window per board: the canvas scene plus the composer (the tray bar).
 @MainActor
-final class CanvasWindowController: NSWindowController, NSWindowDelegate {
+final class CanvasWindowController: NSWindowController, NSWindowDelegate, NSMenuItemValidation {
     let board: Board
     let canvas: CanvasView
     private let tray: ComposerBar
@@ -23,6 +23,10 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     /// A remote board's host and its link (docs/design.md "Client mode"); nil for a local board.
     let remote: RemoteSource?
     private let banner = ConnectionBanner(frame: .zero)
+    private var closedBoardView: ClosedBoardView?
+    var hostBoardClosed: Bool { remote?.mirror.availability == .closed }
+    private var languages: LanguageService { remote?.languages ?? CodeNavigation.languages }
+    private var navigationRoot: URL { remote == nil ? board.workingRoot : board.root }
 
     /// The board in front: the frontmost visible board window, with tabs its selected tab (the
     /// others are ordered out). What menu commands and ⌘Z act on, also while a panel such as
@@ -30,7 +34,8 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     static var frontmost: CanvasWindowController? {
         NSApp.orderedWindows.lazy.compactMap { window -> CanvasWindowController? in
             guard window.isVisible, window.tabGroup.map({ $0.selectedWindow === window }) ?? true else { return nil }
-            return window.windowController as? CanvasWindowController
+            guard let controller = window.windowController as? CanvasWindowController, controller.isBoardOpen else { return nil }
+            return controller
         }.first
     }
 
@@ -192,10 +197,9 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
                 self?.selectGoToLines(nil, in: id)
             case .heading(let id, let line): self?.canvas.go(to: id, heading: line)
             case .file(let path, let lines):
-                // Relative to the listed checkout (`Board.workingRoot`), as the board stores it.
-                guard let board = self?.board else { return }
-                let stored = board.relativePath(path.hasPrefix("/") ? path : board.workingRoot.appendingPathComponent(path).path)
-                if let id = self?.open(path: stored, lines: lines) { self?.selectGoToLines(lines, in: id) }
+                guard let self else { return }
+                let stored = self.board.relativePath(path.hasPrefix("/") ? path : self.navigationRoot.appendingPathComponent(path).path)
+                if let id = self.open(path: stored, lines: lines) { self.selectGoToLines(lines, in: id) }
             case .status: break
             }
         }
@@ -249,13 +253,43 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
         ])
         let mirror = remote.mirror, host = remote.host.name
         banner.onRetry = { mirror.reconnect() }
-        banner.show(mirror.state, host: host, problem: mirror.problem)
-        mirror.onState = { [weak self] state in self?.banner.show(state, host: host, problem: mirror.problem) }
+        banner.show(mirror.state, availability: mirror.availability, host: host, problem: mirror.problem)
+        mirror.onState = { [weak self, weak mirror] state in
+            guard let mirror else { return }
+            self?.banner.show(state, availability: mirror.availability, host: host, problem: mirror.problem)
+        }
+        mirror.onAvailability = { [weak self] _ in self?.hostBoardAvailabilityChanged() }
+        if hostBoardClosed { hostBoardAvailabilityChanged() }
         mirror.onNotice = { [weak self] text in self?.canvas.showNotice(text) }
         mirror.onRedraw = { [weak self] in self?.canvas.redrawRemoteTiles() }
+        mirror.onDrawingMachines = { [weak self] in self?.canvas.drawingMachinesChanged() }
         sendPrompt = { text, terminal, mentions, answer in
             try await mirror.prompt(text, to: terminal, mentions: mentions, answer: answer)
         }
+    }
+
+    private func hostBoardAvailabilityChanged() {
+        guard let remote, let container = window?.contentView else { return }
+        if hostBoardClosed {
+            guard closedBoardView == nil else { return }
+            banner.isHidden = true
+            window?.makeFirstResponder(nil)
+            for tile in canvas.tiles.values {
+                tile.setHostBoardClosed(true)
+            }
+            let cover = ClosedBoardView(canvas: canvas, frame: container.bounds)
+            cover.autoresizingMask = [.width, .height]
+            container.addSubview(cover, positioned: .below, relativeTo: banner)
+            closedBoardView = cover
+            window?.makeFirstResponder(cover)
+        } else {
+            closedBoardView?.removeFromSuperview()
+            closedBoardView = nil
+            for tile in canvas.tiles.values {
+                tile.setHostBoardClosed(false)
+            }
+        }
+        banner.show(remote.mirror.state, availability: remote.mirror.availability, host: remote.host.name, problem: remote.mirror.problem)
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
@@ -269,6 +303,7 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func apply(_ event: BoardEvent) {
+        guard !canvas.discarded else { return }
         canvas.apply(event)
         drawing?.apply(event)
         switch event {
@@ -534,26 +569,63 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        guard isBoardOpen else { return }
         // The API's default board is one of this app's own, never a mirror of another's.
-        if remote == nil { registry.frontmost = board.id }
+        if let remote { remote.mirror.userFocused() } else { registry.frontmost = board.id }
     }
 
-    /// The board's tab or window closed (not app quit, which closes nothing).
+    /// On an easld host, this window answers the board's delegated calls and attaches as easld's
+    /// client (`BoardMirror.serve`). An app server answers them itself: nothing attaches there.
+    func serveHost() {
+        guard let remote, remote.host.server == .easld else { return }
+        let identity = ClientIdentity.thisMac
+        if identity.id == nil {
+            canvas.showNotice("This Mac couldn't keep its machine identity in \(AppPaths.clientID.path): it draws none of \(remote.host.name)'s browser tiles")
+        }
+        remote.mirror.serve(ViewerWindow(self), as: identity)
+    }
+
+    /// The board's tab or window closed (not app quit, which closes nothing). A remote board's
+    /// attachment ends or stays as the app delegate decides (`RemoteClose`).
     var onClose: (() -> Void)?
+    var apiCloseInProgress = false
+    var isBoardOpen = true
+    /// A remote board's close as the user asked for it, taken before AppKit changes the window's
+    /// tab group (`CanvasWindow.close`); nil while the window isn't closing.
+    var closing: RemoteClose?
+
+    var isLastOpenBoard: Bool {
+        guard let window, isBoardOpen else { return false }
+        let app = NSApp.delegate as? AppDelegate
+        func isOtherLiveBoard(_ candidate: NSWindow) -> Bool {
+            candidate !== window && (candidate.windowController as? CanvasWindowController)?.isBoardOpen == true
+                && app?.isHoldingClose(candidate) != true
+        }
+        return !(window.tabbedWindows?.contains(where: isOtherLiveBoard) ?? false)
+            && !NSApp.windows.contains(where: isOtherLiveBoard)
+    }
+
+    func discard() {
+        remote?.mirror.close()
+        BrowserExtensions.closedWindow(self)
+        responderObservation = nil
+        canvas.discard()
+    }
 
     /// Closing the tab or window ends nothing: its terminals' sessions keep running (agents go
     /// on working, headless) and come back when the folder is opened again. With any terminal on
     /// the board a sheet says so first, naming what keeps running: Keep Running (Return), End
     /// Sessions (⌘⌫: its terminals close as in the close-terminal sheet, then the tab), Cancel (Esc).
-    /// Closing the last board window quits easl, which the sheet says; the next launch reopens
-    /// the board (`AppDelegate.saveOpenBoards`).
+    /// Closing the last board window quits easl, unless background attach keeps a remote board
+    /// attached, which the sheet says; the next launch reopens the board (`AppDelegate.saveOpenBoards`).
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        // A remote board's terminals are its host's: closing the window detaches from them, nothing more.
+        guard !apiCloseInProgress else { return false }
+        // A remote board's terminals are its host's: closing the window ends nothing on the host.
         guard remote == nil else { return true }
         let terminals = canvas.tiles.values.compactMap { $0.content as? TerminalTile }.sorted { $0.objectID < $1.objectID }
         guard !terminals.isEmpty else { return true }
         let tabs = sender.tabbedWindows?.count ?? 1
-        let last = tabs <= 1 && !NSApp.windows.contains { $0 !== sender && $0 is CanvasWindow && ($0.isVisible || $0.isMiniaturized) }
+        let last = isLastOpenBoard && (NSApp.delegate as? AppDelegate)?.holdsBackgroundAttachments != true
         let keep = SessionProcesses.keepRunningText(terminals.map { $0.sessionProcesses() })
         let alert = NSAlert()
         alert.messageText = "Close “\(board.root.lastPathComponent)” and keep \(terminals.count == 1 ? "its terminal" : "its terminals") running?"
@@ -576,9 +648,12 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        if let remote {
-            remote.mirror.close()
-        } else {
+        guard isBoardOpen else {
+            window?.contentView = nil
+            return
+        }
+        isBoardOpen = false
+        if remote == nil {
             canvas.saveViewport()
             composer.save()
         }
@@ -654,7 +729,7 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     @objc func showNavigator(_ sender: Any?) {
         guard window?.attachedSheet == nil else { return }
         if navigator.isOpen { return navigator.focusField() }
-        let files = BoardFiles.of(board.workingRoot)
+        let files = BoardFiles.of(navigationRoot, languages: languages)
         navigator.open(rows: canvas.navigatorRows(), files: files.index)
         files.refresh { [weak self] index in self?.navigator.update(files: index) }
     }
@@ -766,13 +841,16 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     /// server for those files' languages could answer (not installed, crashed), the answer's
     /// note says why, with its install hint, for the panel's footer (never a row).
     private func workspaceSymbols(named name: String) async -> NavigatorPanel.SymbolAnswer {
-        let root = board.workingRoot
-        var files = board.objects.values.filter { $0.type == .code }.compactMap { $0.props["path"]?.string }.map(board.absoluteURL)
+        let root = navigationRoot
+        let languages = languages
+        var files = board.objects.values.filter {
+            $0.type == .code && (remote == nil || ($0.props["pinnedCommit"]?.string == nil && RefSource.ref(of: $0.props) == nil))
+        }.compactMap { $0.props["path"]?.string }.map(board.absoluteURL)
         if files.isEmpty {
             let configs = LanguageServerConfig.defaults
             var counts: [String: Int] = [:]
             var first: [String: String] = [:]
-            for path in BoardFiles.of(root).index.paths.prefix(20_000) {
+            for path in BoardFiles.of(root, languages: languages).index.paths.prefix(20_000) {
                 let url = URL(fileURLWithPath: path)
                 guard let language = configs.first(where: { $0.languageID(for: url) != nil })?.language else { continue }
                 counts[language, default: 0] += 1
@@ -782,7 +860,7 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
         }
         guard !files.isEmpty else { return NavigatorPanel.SymbolAnswer(rows: []) }
         func ask() async -> Result<[LSPWorkspaceSymbol], Error> {
-            do { return .success(try await CodeNavigation.languages.workspaceSymbols(name, files: files, boardRoot: root)) } catch { return .failure(error) }
+            do { return .success(try await languages.workspaceSymbols(name, files: files, boardRoot: root)) } catch { return .failure(error) }
         }
         var answer = await ask()
         // A server that just started answers before it has read the project (pyright: nothing at
@@ -811,7 +889,7 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
         symbols = symbols.enumerated().sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map(\.element)
         var rows: [NavigatorRow] = []
         for symbol in symbols {
-            let path = Board.relativePath(symbol.location.url.path, root: root)
+            let path = languages.relativePath(symbol.location.url.path, boardRoot: root)
             guard !path.hasPrefix("/") else { continue }
             let line = symbol.location.range.start.line + 1
             rows.append(NavigatorRow(target: .file(path, lines: LineRange(start: line, end: line)), title: symbol.name, kind: symbol.kindName.capitalized, dot: nil,
@@ -834,10 +912,6 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
         canvas.exitGroup()
     }
 
-    /// ⌘Z undoes the latest board change (the user's or an agent's). A text field or editor with
-    /// its own pending edits undoes those first; a terminal holding the keyboard keeps ⌘Z and ⇧⌘Z
-    /// for its program (`canvasUndoApplies`). No undo or redo is silent: a notice names what it
-    /// did and whose change it was (`UndoHistory.Step.notice`).
     @objc func undoCanvas(_ sender: Any?) { undo(redo: false) }
     @objc func redoCanvas(_ sender: Any?) { undo(redo: true) }
 
@@ -846,6 +920,14 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
             return redo ? manager.redo() : manager.undo()
         }
         guard canvasUndoApplies(redo: redo) else { return }
+        if let remote {
+            let replay = remote.mirror.undo(redo: redo)
+            Task {
+                let notice = await replay.value
+                if let notice { canvas.showNotice(notice) }
+            }
+            return
+        }
         let step = redo ? board.nextRedo : board.nextUndo
         guard redo ? board.redo() : board.undo(), let step, let notice = step.notice(redo: redo, author: board.authorName(step.author)) else { return }
         canvas.showNotice(notice)
@@ -858,8 +940,6 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     private var canvasUndoApplies: Bool { canvasUndoApplies(redo: false) }
 
     private func canvasUndoApplies(redo: Bool) -> Bool {
-        // A remote board's changes are its host's: no undo for them here (v1).
-        guard !board.isRemote else { return false }
         guard let terminal = canvas.focusedTerminal else { return true }
         return (redo ? board.nextRedo : board.nextUndo)?.pastedInto == terminal
     }
@@ -912,6 +992,7 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     /// Edit ▸ Select All reaching the board: a text field or view holding the keyboard (a browser
     /// tile's address, a filter, a note being edited) selects its own text; else every object.
     @objc func selectAllObjects(_ sender: Any?) {
+        guard !hostBoardClosed else { return }
         if let text = window?.firstResponder as? NSText { return text.selectAll(sender) }
         canvas.selectAll()
     }
@@ -1081,8 +1162,8 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     /// View ▸ Leave Tile (⌘Esc): the one way out of a terminal, whose Esc belongs to its program.
     @objc func leaveTile(_ sender: Any?) { canvas.focusedTile.map(canvas.leaveTile) }
 
-    /// Whether a menu item applies now (AppDelegate forwards the menu bar's validation here).
-    func validate(_ item: NSMenuItem) -> Bool {
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if hostBoardClosed, let action = item.action, !Self.closedBoardActions.contains(action) { return false }
         let selection = canvas.selection
         if remote != nil, let action = item.action, Self.localOnly.contains(action) { return false }
         switch item.action {
@@ -1117,7 +1198,7 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
             return true
         case #selector(clearAttentionMarkers(_:)): return !board.attention.isEmpty
         case #selector(copyAsImage(_:)), #selector(saveAsPNG(_:)): return !selection.isEmpty
-        case #selector(saveHTMLTile(_:)), #selector(openHTMLTileInBrowser(_:)): return selected(.html) != nil
+        case #selector(saveHTMLTile(_:)), #selector(openHTMLTileInBrowser(_:)): return selected(.html) != nil && !board.isRemote
         case #selector(openPageInBrowser(_:)): return selected(.browser) != nil
         case #selector(copyNoteAsMarkdown(_:)), #selector(saveNoteAsMarkdown(_:)): return selected(.note) != nil
         case #selector(toggleWebInspector(_:)):
@@ -1167,11 +1248,16 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// What a remote board's window doesn't offer (v1): commands that read this Mac's files or
-    /// git for the board (the host's aren't here), the first-run walk-through, and restacking,
-    /// which the API can't send.
+    /// git for the board (the host's aren't here), and the first-run walk-through.
     private static let localOnly: Set<Selector> = [
         #selector(openCodeTile(_:)), #selector(reviewChanges(_:)), #selector(reviewBranch(_:)), #selector(toggleGetStarted(_:)),
-        #selector(bringToFront(_:)), #selector(sendToBack(_:)), #selector(snapshotPage(_:)),
+        #selector(snapshotPage(_:)),
+    ]
+
+    private static let closedBoardActions: Set<Selector> = [
+        #selector(zoomToFit(_:)), #selector(zoomToActual(_:)), #selector(zoomIn(_:)), #selector(zoomOut(_:)),
+        #selector(leaveTile(_:)), #selector(goToNextNeedsYou(_:)), #selector(AppDelegate.openBoard(_:)),
+        #selector(NSText.copy(_:)), #selector(NSText.selectAll(_:)),
     ]
 
     /// A text view with its own undo history holding the keyboard (a note being edited).
@@ -1271,6 +1357,30 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
     /// beat Ghostty's own bindings (its defaults bind ⌘T, ⌘N, ⌘Q, ⌘⇧[ and ⌘⇧] to tab, window and
     /// app actions the embedded library can't perform, so the key would do nothing).
     func handleKeyEquivalent(_ event: NSEvent) -> Bool {
+        if hostBoardClosed {
+            if let action = Self.navigationAction(for: event), Self.closedBoardActions.contains(action) {
+                perform(action, with: self)
+                return true
+            }
+            let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            if flags == .command, let key = event.charactersIgnoringModifiers, key == "a" || key == "c" {
+                let action = key == "a" ? #selector(NSText.selectAll(_:)) : #selector(NSText.copy(_:))
+                if let responder = window?.firstResponder,
+                   responder is CodeRowsView || responder is QuestionTile || (responder as? NSTextView)?.isEditable == false,
+                   responder.responds(to: action) {
+                    responder.perform(action, with: nil)
+                }
+                return true
+            }
+            if Self.menuItem(for: event, in: NSApp.mainMenu) != nil {
+                _ = NSApp.mainMenu?.performKeyEquivalent(with: event)
+                return true
+            }
+            if flags.isEmpty || flags == .shift {
+                if [53, 115, 116, 119, 121, 123, 124, 125, 126].contains(event.keyCode) { return false }
+            }
+            return true
+        }
         if let action = Self.navigationAction(for: event) {
             perform(action, with: self)
             return true
@@ -1323,29 +1433,105 @@ final class CanvasWindowController: NSWindowController, NSWindowDelegate {
 /// and a focused terminal would otherwise claim ⌘0/⌘=/⌘-/⌘9 as Ghostty bindings (font size,
 /// tabs), ⌘W as close surface, and a web view ⌘=/⌘- as page zoom. Everything else (⌘C, ⌘V, ⌘A,
 /// typing) stays with the focused view. Likewise ⌘-scroll zooms the canvas wherever the pointer
-/// is on it, over a tile too; plain scrolling stays with the tile under the pointer.
+/// is on it, over a tile too; plain scrolling stays with the tile under the pointer. A middle-button
+/// drag pans it from anywhere on it the same way.
 final class CanvasWindow: NSWindow {
+    /// A middle-button press on the canvas, and the press itself to hand on if it ends a click.
+    private var middlePan: (pan: CanvasDragPan, press: NSEvent)?
+
+    override init(contentRect: NSRect, styleMask style: NSWindow.StyleMask, backing backingStoreType: NSWindow.BackingStoreType, defer flag: Bool) {
+        super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
+        NotificationCenter.default.addObserver(self, selector: #selector(cancelMiddlePan), name: NSApplication.didResignActiveNotification, object: nil)
+    }
+
+    override func close() {
+        let app = NSApp.delegate as? AppDelegate
+        if let controller = windowController as? CanvasWindowController, controller.remote != nil, controller.closing == nil {
+            controller.closing = (tabGroup?.windows.count ?? 1) > 1 ? .tab : .window
+        }
+        if let controller = windowController as? CanvasWindowController, app?.prepareNativeClose(controller) == false { return }
+        guard app?.holdNativeClose(self) != true else { return }
+        super.close()
+        app?.releaseHeldCloses()
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if let controller = windowController as? CanvasWindowController, controller.handleKeyEquivalent(event) { return true }
         return super.performKeyEquivalent(with: event)
     }
 
-    /// Typing reaches the focused tile through here (`CanvasWindowController.keyTyped`), and a
-    /// ⌘-scroll anywhere on the canvas zooms it (`zoomsCanvas`).
+    /// Typing reaches the focused tile through here (`CanvasWindowController.keyTyped`), a
+    /// ⌘-scroll anywhere on the canvas zooms it (`zoomsCanvas`), and a middle-button drag pans it
+    /// (`middleDragPans`). Every event monitor has seen the event by now.
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown, let controller = windowController as? CanvasWindowController { controller.keyTyped(event) }
         if event.type == .scrollWheel, zoomsCanvas(event, at: event.locationInWindow) { return }
+        if middleDragPans(event) { return }
         super.sendEvent(event)
+    }
+
+    override func resignKey() {
+        super.resignKey()
+        cancelMiddlePan()
+    }
+
+    /// The canvas, when `point` (window coordinates) is on it, over a tile too.
+    private func canvas(at point: NSPoint) -> CanvasView? {
+        guard let canvas = (windowController as? CanvasWindowController)?.canvas, let content = contentView,
+              content.hitTest(content.superview?.convert(point, from: nil) ?? point)?.isDescendant(of: canvas) == true else { return nil }
+        return canvas
     }
 
     /// A ⌘-scroll at `point` (window coordinates) over the canvas goes to the canvas
     /// (`CanvasWheel`), which zooms. The modifiers first: every other scroll event skips the hit test.
     func zoomsCanvas(_ event: NSEvent, at point: NSPoint) -> Bool {
         guard event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
-              let canvas = (windowController as? CanvasWindowController)?.canvas, let content = contentView,
-              content.hitTest(content.superview?.convert(point, from: nil) ?? point)?.isDescendant(of: canvas) == true else { return false }
+              let canvas = canvas(at: point) else { return false }
         canvas.scrollWheel(with: event)
         return true
+    }
+
+    /// Middle-button presses, drags and releases (`CanvasDragPan`): true when the event was taken.
+    /// A press on the canvas is held back until the pointer moves (a pan) or the button comes up
+    /// first (a click, so the press and then the release go on to what's under it).
+    private func middleDragPans(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .otherMouseDown where event.buttonNumber == 2:
+            cancelMiddlePan()
+            guard !HyperMonitor.isHyper(event.modifierFlags), canvas(at: event.locationInWindow) != nil else { return false }
+            middlePan = (CanvasDragPan(at: event.locationInWindow), event)
+            return true
+        case .otherMouseDragged where event.buttonNumber == 2:
+            guard var gesture = middlePan else { return false }
+            let wasPanning = gesture.pan.panning
+            let delta = gesture.pan.move(to: event.locationInWindow)
+            middlePan = gesture
+            guard let delta, let canvas = (windowController as? CanvasWindowController)?.canvas else { return true }
+            if !wasPanning { NSCursor.closedHand.push() }
+            canvas.pan(by: delta)
+            return true
+        case .otherMouseUp where event.buttonNumber == 2:
+            guard let ended = middlePan else { return false }
+            middlePan = nil
+            if ended.pan.panning {
+                NSCursor.pop()
+                return true
+            }
+
+            // A middle click that never moved: what's under it gets the press after all, then this release.
+            super.sendEvent(ended.press)
+            return false
+        default:
+            return false
+        }
+    }
+
+    /// Drops a middle-button press or pan whose release won't reach this window (the app or window
+    /// stopped taking input, another press began), and the hand cursor it showed.
+    @objc private func cancelMiddlePan() {
+        guard let ended = middlePan else { return }
+        middlePan = nil
+        if ended.pan.panning { NSCursor.pop() }
     }
 }
 

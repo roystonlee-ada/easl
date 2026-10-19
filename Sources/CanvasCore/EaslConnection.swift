@@ -16,6 +16,10 @@ import Foundation
 /// is never resent: it may or may not have applied. One link carries every request in order (the
 /// app answers a connection's requests one at a time), so a long `agent.wait` holds up the rest.
 ///
+/// The server's own calls on the link (`{id: "easld-<n>", method, params}`, docs/design/next.md
+/// "Framing": an easld this viewer attached to as its client) go to `serve`'s handler, each in a
+/// task of its own, and each answer goes back with the call's id on the link it came on.
+///
 /// Thread-safe; every link callback runs on one serial queue.
 public final class EaslConnection: @unchecked Sendable {
     public enum State: String, Sendable {
@@ -27,6 +31,11 @@ public final class EaslConnection: @unchecked Sendable {
         public var name: String
         public var board: BoardID?
         public var data: JSONValue
+        var sequence: UInt64 = 0
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.name == rhs.name && lhs.board == rhs.board && lhs.data == rhs.data
+        }
 
         public init(name: String, board: BoardID?, data: JSONValue) {
             self.name = name
@@ -49,6 +58,18 @@ public final class EaslConnection: @unchecked Sendable {
         }
 
         public var description: String { "\(code): \(message)" }
+    }
+
+    /// A request the server sent on this link: one of `client.attach`'s delegated calls.
+    public struct Call: Sendable {
+        public var method: String
+        public var params: JSONValue
+        var eventsThrough: UInt64 = 0
+
+        public init(method: String, params: JSONValue) {
+            self.method = method
+            self.params = params
+        }
     }
 
     /// Waits between attempts: `initial`, doubling after each failed one, at most `maximum`;
@@ -111,6 +132,8 @@ public final class EaslConnection: @unchecked Sendable {
 
     /// The current state.
     public var state: State { queue.sync { current } }
+
+    public var schemaVersion: Int? { queue.sync { advertisedSchemaVersion } }
 
     /// Why the connection isn't online, for the user: the relay's last stderr line (ssh's
     /// "Connection refused", nc's "No such file or directory"), a refused connect, a silent
@@ -192,6 +215,14 @@ public final class EaslConnection: @unchecked Sendable {
         }
     }
 
+    /// Answers the server's calls with `handler` from now on (nil: each fails `unavailable`). Each
+    /// runs in a task of its own, so a slow one holds up neither the others nor this link's own
+    /// requests and events. An answer goes back on the link its call came on, or nowhere once that
+    /// link is gone: the server answered its caller then, and a new link's ids start again.
+    public func serve(_ handler: (@Sendable (Call) async -> Result<JSONValue, Failure>)?) {
+        queue.async { self.server = handler }
+    }
+
     /// Ends the link and every request, and stops reconnecting. The state ends `offline`, and
     /// `states()` and `events()` finish.
     public func close() {
@@ -203,6 +234,8 @@ public final class EaslConnection: @unchecked Sendable {
             self.link?.tearDown()
             self.link = nil
             self.handshake = []
+            self.handshakePing = nil
+            self.advertisedSchemaVersion = nil
             self.handshakeTimer?.cancel()
             self.failAll(Failure("unavailable", "the connection was closed"))
             self.reason = "closed"
@@ -230,6 +263,8 @@ public final class EaslConnection: @unchecked Sendable {
     private var subscriptions: [JSONValue] = []
     /// The current link's handshake requests not answered yet; online when empty.
     private var handshake: Set<Int> = []
+    private var handshakePing: Int?
+    private var advertisedSchemaVersion: Int?
     private var handshakeTimer: DispatchWorkItem?
     /// Handshake ids count down from -1, apart from requests' ids.
     private var handshakeIDs = 0
@@ -240,6 +275,9 @@ public final class EaslConnection: @unchecked Sendable {
     private var cancelled: Set<Int> = []
     private var stateWatchers: [UUID: AsyncStream<State>.Continuation] = [:]
     private var eventWatchers: [UUID: AsyncStream<Event>.Continuation] = [:]
+    private var eventSequence: UInt64 = 0
+    /// What answers the server's calls (`serve`).
+    private var server: (@Sendable (Call) async -> Result<JSONValue, Failure>)?
 
     private struct Pending {
         var method: String
@@ -265,6 +303,22 @@ public final class EaslConnection: @unchecked Sendable {
         // The schema's ids are strings.
         let message: JSONValue = .object(["id": .string(String(id)), "method": .string(method), "params": params])
         return ((try? JSONEncoder().encode(message)) ?? Data()) + [0x0A]
+    }
+
+    /// The answer to the server's call `id`: `{id, ok: true, result}` or `{id, ok: false, error}`.
+    private static func answerLine(id: String, _ answer: Result<JSONValue, Failure>) -> Data {
+        var message: [String: JSONValue] = ["id": .string(id)]
+        switch answer {
+        case .success(let result):
+            message["ok"] = .bool(true)
+            message["result"] = result
+        case .failure(let failure):
+            var error: [String: JSONValue] = ["code": .string(failure.code), "message": .string(failure.message)]
+            if let data = failure.data { error["data"] = data }
+            message["ok"] = .bool(false)
+            message["error"] = .object(error)
+        }
+        return ((try? JSONEncoder().encode(JSONValue.object(message))) ?? Data()) + [0x0A]
     }
 
     private func enqueue(_ id: Int, _ method: String, _ params: JSONValue, _ timeout: Duration?, _ continuation: CheckedContinuation<JSONValue, Error>) {
@@ -397,12 +451,20 @@ public final class EaslConnection: @unchecked Sendable {
         return fd
     }
 
-    /// Starts reading and writing `link`; its read fd is closed when reading stops, its write fd
-    /// when the writer is closed.
+    /// Starts reading and writing `link`. Each fd is closed by its source's cancel handler: the
+    /// read fd's once reading stops, the write fd's once writing stops (`Link.stopWriting`).
     private func start(_ link: Link) -> Link {
-        _ = fcntl(link.writeFD, F_SETNOSIGPIPE, 1)
         let writeFD = link.writeFD
-        link.writer = DispatchIO(type: .stream, fileDescriptor: writeFD, queue: queue) { _ in Darwin.close(writeFD) }
+        _ = fcntl(writeFD, F_SETNOSIGPIPE, 1)
+        // `write` runs on `queue`, so a full pipe or socket must refuse rather than block it.
+        _ = fcntl(writeFD, F_SETFL, fcntl(writeFD, F_GETFL) | O_NONBLOCK)
+        let writable = DispatchSource.makeWriteSource(fileDescriptor: writeFD, queue: queue)
+        writable.setEventHandler { [weak self, weak link] in
+            guard let self, let link else { return }
+            self.flush(link)
+        }
+        writable.setCancelHandler { Darwin.close(writeFD) }
+        link.writer = .idle(writable)
         let readFD = link.readFD
         _ = fcntl(readFD, F_SETFL, fcntl(readFD, F_GETFL) | O_NONBLOCK)
         let source = DispatchSource.makeReadSource(fileDescriptor: readFD, queue: queue)
@@ -419,6 +481,7 @@ public final class EaslConnection: @unchecked Sendable {
     private func read(_ link: Link) {
         /// nil while the link is open; else why it ended (EOF is "").
         var ended: String?
+        var search = link.buffer.count
         while true {
             let count = link.chunk.withUnsafeMutableBytes { Darwin.read(link.readFD, $0.baseAddress, $0.count) }
             if count > 0 {
@@ -431,9 +494,10 @@ public final class EaslConnection: @unchecked Sendable {
             break
         }
         var start = 0
-        while let newline = link.buffer[start...].firstIndex(of: 0x0A) {
+        while let newline = link.buffer[search...].firstIndex(of: 0x0A) {
             let line = link.buffer[start..<newline]
             start = newline + 1
+            search = start
             guard !line.isEmpty, let message = try? JSONDecoder().decode(JSONValue.self, from: Data(line)) else { continue }
             receive(message, on: link)
             // A message may have dropped this link (a failed handshake).
@@ -450,9 +514,18 @@ public final class EaslConnection: @unchecked Sendable {
 
     private func receive(_ message: JSONValue, on link: Link) {
         if let name = message["event"]?.string {
-            let event = Event(name: name, board: message["board"]?.string, data: message["data"] ?? .null)
+            guard !eventWatchers.isEmpty else { return }
+            eventSequence += 1
+            var event = Event(name: name, board: message["board"]?.string, data: message["data"] ?? .null)
+            event.sequence = eventSequence
             for watcher in eventWatchers.values { watcher.yield(event) }
             return
+        }
+        if let method = message["method"]?.string {
+            guard let id = message["id"]?.string else { return }
+            var call = Call(method: method, params: message["params"] ?? .object([:]))
+            call.eventsThrough = eventSequence
+            return called(call, id: id, on: link)
         }
         guard let id = message["id"]?.string.flatMap({ Int($0) }) else { return }
         let failure = message["ok"]?.bool == true ? nil : Failure(
@@ -463,15 +536,35 @@ public final class EaslConnection: @unchecked Sendable {
             guard handshake.remove(id) != nil else { return }
             // A server that refuses `system.ping` (or a subscription) isn't one to talk to.
             if let failure { return lost(link.generation, reason: "the server refused the handshake: \(failure)") }
+            if id == handshakePing {
+                advertisedSchemaVersion = message["result"]?["version"]?.int
+                handshakePing = nil
+            }
             if handshake.isEmpty { cameOnline(link) }
             return
         }
         finish(id, failure.map { .failure($0) } ?? .success(message["result"] ?? .null))
     }
 
+    /// Runs the server's call off this queue (its handler may wait on the main actor, which may be
+    /// waiting on this queue), then writes the answer on `link` if that is still the link.
+    private func called(_ call: Call, id: String, on link: Link) {
+        let handler = server
+        Task { [weak self] in
+            let answer = await handler?(call) ?? .failure(Failure("unavailable", "this client serves no calls on this connection"))
+            guard let self else { return }
+            self.queue.async {
+                guard self.link === link else { return }
+                self.write(Self.answerLine(id: id, answer), on: link)
+            }
+        }
+    }
+
     private func startHandshake(on link: Link) {
         let ping = nextHandshakeID()
         handshake = [ping]
+        handshakePing = ping
+        advertisedSchemaVersion = nil
         write(line(id: ping, method: "system.ping", params: .object([:])), on: link)
         for params in subscriptions {
             let id = nextHandshakeID()
@@ -501,13 +594,56 @@ public final class EaslConnection: @unchecked Sendable {
         }
     }
 
+    /// Sends `line` after what `link` hasn't written yet; dropped once the link stopped writing.
     private func write(_ line: Data, on link: Link) {
+        guard link.writer != nil else { return }
+        link.outbox.append(line)
+        // Lines already waiting hold the source, which writes this one after them.
+        if link.outbox.count == 1 { flush(link) }
+    }
+
+    /// Writes `link.outbox` in order until it is empty or the fd is full; a full fd's source calls
+    /// this again once the fd takes more. A failure is reported on a later turn of the queue, as
+    /// DispatchIO's was, so no caller sees its link dropped in the middle of a write.
+    private func flush(_ link: Link) {
         guard let writer = link.writer else { return }
-        let bytes = line.withUnsafeBytes { DispatchData(bytes: $0) }
-        let generation = link.generation
-        writer.write(offset: 0, data: bytes, queue: queue) { [weak self] done, _, error in
-            guard done, error != 0 else { return }
-            self?.lost(generation, reason: "write failed: \(String(cString: strerror(error)))")
+        var done = link.outboxHead
+        while done < link.outbox.count {
+            let line = link.outbox[done]
+            let count = line.withUnsafeBytes { bytes in
+                let rest = UnsafeRawBufferPointer(rebasing: bytes[link.written...])
+                return Darwin.write(link.writeFD, rest.baseAddress, rest.count)
+            }
+            if count > 0 {
+                link.written += count
+                if link.written == line.count {
+                    link.written = 0
+                    link.outbox[done] = Data()
+                    done += 1
+                }
+                continue
+            }
+            let code = errno
+            if code == EINTR { continue }
+            if code == EAGAIN {
+                link.outboxHead = done
+                if case .idle(let source) = writer {
+                    source.resume()
+                    link.writer = .blocked(source)
+                }
+                return
+            }
+            link.stopWriting()
+            let generation = link.generation
+            let reason = "write failed: \(String(cString: strerror(code)))"
+            queue.async { [weak self] in self?.lost(generation, reason: reason) }
+            return
+        }
+        link.outbox.removeAll(keepingCapacity: true)
+        link.outboxHead = 0
+        if case .blocked(let source) = writer {
+            source.suspend()
+            link.writer = .idle(source)
         }
     }
 
@@ -546,6 +682,8 @@ public final class EaslConnection: @unchecked Sendable {
         link?.tearDown()
         link = nil
         handshake = []
+        handshakePing = nil
+        advertisedSchemaVersion = nil
         handshakeTimer?.cancel()
         handshakeTimer = nil
         for (id, request) in pending where request.sentOn != nil {
@@ -573,7 +711,13 @@ private final class Link: @unchecked Sendable {
     let writeFD: Int32
     let process: Process?
     var source: DispatchSourceRead?
-    var writer: DispatchIO?
+    /// The write fd's source, made in `start` and resumed only while `outbox` waits on a full fd,
+    /// so a link that never fills it gets no write events. Nil before `start` and once stopped.
+    var writer: Writer?
+    /// Cleared slots before `outboxHead` avoid shifting pending lines after every partial drain.
+    var outbox: [Data] = []
+    var outboxHead = 0
+    var written = 0
     var errors: Pipe?
     var buffer: [UInt8] = []
     var chunk = [UInt8](repeating: 0, count: 64 * 1024)
@@ -606,13 +750,37 @@ private final class Link: @unchecked Sendable {
         return "\(name) exited\(status)" + (last.map { ": \($0)" } ?? "")
     }
 
+    enum Writer {
+        /// Suspended, or not activated yet.
+        case idle(DispatchSourceWrite)
+        /// Resumed: fires once the fd takes more.
+        case blocked(DispatchSourceWrite)
+    }
+
     func tearDown() {
         source?.cancel()
         source = nil
-        writer?.close(flags: .stop)
-        writer = nil
+        stopWriting()
         errors?.fileHandleForReading.readabilityHandler = nil
         if let process, process.isRunning { process.terminate() }
+    }
+
+    /// Drops what wasn't written. The source's cancel handler closes the write fd, and runs only
+    /// once the source is resumed, so an idle one is resumed after it is cancelled.
+    func stopWriting() {
+        switch writer {
+        case .idle(let source)?:
+            source.cancel()
+            source.resume()
+        case .blocked(let source)?:
+            source.cancel()
+        case nil:
+            break
+        }
+        writer = nil
+        outbox = []
+        outboxHead = 0
+        written = 0
     }
 }
 

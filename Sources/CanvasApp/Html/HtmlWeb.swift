@@ -3,13 +3,22 @@ import CanvasCore
 import CryptoKit
 import WebKit
 
-/// Compiled network rule lists, one per distinct allowlist, shared by every HTML tile.
+/// Compiled local allowlists and the fixed remote connection-hint guard, shared by HTML tiles.
 @MainActor
 enum HtmlRuleLists {
     private static var compiled: [String: WKContentRuleList] = [:]
 
     static func list(allowing hosts: [String]) async throws -> WKContentRuleList {
-        let json = HtmlKit.networkRules(allow: hosts)
+        try await compile(HtmlKit.networkRules(allow: hosts))
+    }
+
+    /// CSP does not constrain DNS prefetch or preconnect. Never compile host data for a remote page.
+    /// WebKit classifies these hints as pings, so this also refuses anchor link pings.
+    static func remote() async throws -> WKContentRuleList {
+        try await compile(#"[{"trigger":{"url-filter":"^https?:","resource-type":["ping"]},"action":{"type":"block"}}]"#)
+    }
+
+    private static func compile(_ json: String) async throws -> WKContentRuleList {
         let identifier = "canvas-html-" + SHA256.hash(data: Data(json.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
         if let list = compiled[identifier] { return list }
         guard let list = try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: identifier, encodedContentRuleList: json) else {
@@ -34,21 +43,48 @@ final class HtmlSchemeHandler: NSObject, WKURLSchemeHandler {
     private static var kitCache: [String: Data] = [:]
     /// Image requests still being read; a task WebKit stopped meanwhile gets no reply.
     private var reading: Set<ObjectIdentifier> = []
+    private var hostReads: [ObjectIdentifier: Task<Void, Never>] = [:]
 
     init(tile: HtmlTile?) {
         self.tile = tile
     }
 
     func webView(_ webView: WKWebView, start task: any WKURLSchemeTask) {
-        guard let url = task.request.url, url.host == HtmlKit.host, let tile else {
+        guard let url = task.request.url, url.host == HtmlKit.host, let tile, !tile.hostBoardClosed else {
             return task.didFailWithError(URLError(.fileDoesNotExist))
         }
         if url.path == HtmlKit.pageURL(tile: tile.objectID).path {
-            respond(task, url: url, data: Data(HtmlKit.document(html: tile.html).utf8), type: "text/html", cache: "no-store")
+            respond(task, url: url, data: Data(tile.document.utf8), type: "text/html", cache: "no-store")
         } else if let kitRoot = Self.kitRoot, let file = HtmlKit.kitFile(requestPath: url.path, kitRoot: kitRoot),
                   let data = Self.kitCache[file.path] ?? (try? Data(contentsOf: file, options: .alwaysMapped)) {
             Self.kitCache[file.path] = data
             respond(task, url: url, data: data, type: HtmlKit.mimeType(file), cache: "max-age=31536000, immutable")
+        } else if tile.isRemote {
+            guard let files = tile.files,
+                  let request = LocalImage.hostPageFile(requestPath: url.path, source: tile.hostImageSource, temps: files.temps) else {
+                return notFound(task, url: url)
+            }
+            let key = ObjectIdentifier(task)
+            hostReads[key] = Task { @MainActor [weak self] in
+                let result: Result<HostFile, Error>
+                do { result = .success(try await files.read(request)) }
+                catch { result = .failure(error) }
+                guard let self, self.hostReads.removeValue(forKey: key) != nil, !Task.isCancelled else { return }
+                switch result {
+                case .success(let file):
+                    self.tile?.hostImageFinished(url, error: nil, in: webView)
+                    self.respond(task, url: url, data: file.data, type: file.mimeType, cache: "no-store")
+                case .failure(let error):
+                    self.tile?.hostImageFinished(url, error: error, in: webView)
+                    let failure = error as? HostFileError ?? .unavailable(String(describing: error))
+                    if case .unavailable = failure {
+                        task.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost,
+                                                     userInfo: [NSLocalizedDescriptionKey: HostGit.refusal(failure)]))
+                    } else {
+                        self.notFound(task, url: url)
+                    }
+                }
+            }
         } else if let file = LocalImage.pageFile(requestPath: url.path, root: tile.boardRoot) {
             let key = ObjectIdentifier(task)
             reading.insert(key)
@@ -67,19 +103,25 @@ final class HtmlSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     private func notFound(_ task: any WKURLSchemeTask, url: URL) {
-        let response = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/plain"])!
-        task.didReceive(response)
-        task.didReceive(Data("not found".utf8))
-        task.didFinish()
+        respond(task, url: url, data: Data("not found".utf8), type: "text/plain", cache: "no-store", status: 404)
+    }
+
+    func cancelHostReads() {
+        for task in hostReads.values { task.cancel() }
+        hostReads.removeAll()
     }
 
     func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {
         reading.remove(ObjectIdentifier(task))
+        hostReads.removeValue(forKey: ObjectIdentifier(task))?.cancel()
     }
 
-    private func respond(_ task: any WKURLSchemeTask, url: URL, data: Data, type: String, cache: String) {
-        let headers = ["Content-Type": type, "Content-Length": String(data.count), "Cache-Control": cache]
-        task.didReceive(HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!)
+    private func respond(_ task: any WKURLSchemeTask, url: URL, data: Data, type: String, cache: String, status: Int = 200) {
+        guard let tile, !tile.hostBoardClosed else { return task.didFailWithError(URLError(.cancelled)) }
+        var headers = ["Content-Type": type, "Content-Length": String(data.count), "Cache-Control": cache]
+        // A framed SVG is its own active document and does not inherit the page's meta CSP.
+        if let policy = tile.contentSecurityPolicy { headers["Content-Security-Policy"] = policy }
+        task.didReceive(HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!)
         task.didReceive(data)
         task.didFinish()
     }

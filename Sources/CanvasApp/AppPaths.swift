@@ -1,8 +1,15 @@
 import CanvasCore
 import Foundation
+import Darwin
 
 /// Filesystem locations the app depends on (docs/contracts.md).
 enum AppPaths {
+    /// Consumed at process entry so shells and other children cannot inherit the marker.
+    static let isUpdateRelaunch: Bool = {
+        let marked = ProcessInfo.processInfo.environment["EASL_UPDATE_RELAUNCH"] == "1"
+        unsetenv("EASL_UPDATE_RELAUNCH")
+        return marked
+    }()
     /// `EASL_HOME` relocates sockets and boards so a development build can run beside the
     /// installed app (docs/testing.md).
     static let support: URL = {
@@ -38,19 +45,24 @@ enum AppPaths {
     static let getStarted = support.appendingPathComponent("get-started.json")
     /// Roots of the boards open as tabs, in tab order, reopened at the next launch.
     static let openBoards = support.appendingPathComponent("open-boards.json")
+    static let updateBoards = support.appendingPathComponent("update-boards.json")
+    static let updateBoardRecovery = support.appendingPathComponent("update-board-recovery", isDirectory: true)
     /// The hosts File › Open Remote… connected to, newest first (`RemoteHost.Recents`): how to
     /// reach them, never their boards.
     static let remoteHosts = support.appendingPathComponent("remote-hosts.json")
-    /// Testing only: the easl support directory to use on every remote host instead of its own
-    /// (a development instance there, docs/testing.md).
+    /// The remote easld boards background attach attaches again (`RemoteReopen`): how to reach each
+    /// one, never what it holds.
+    static let remoteBoards = support.appendingPathComponent("remote-boards.json")
+    /// Testing only: the home for new remote hosts and legacy saved addresses. Fully saved
+    /// addresses keep their home; the host's default server is refused while this is set.
     static let devRemoteHome: String? = ProcessInfo.processInfo.environment["EASL_DEV_REMOTE_HOME"].flatMap { $0.isEmpty ? nil : $0 }
     /// Where this client left each board's view (`SavedViewport`), one `<boardId>.json` per board.
     /// Client state, not the board's: a board is shared by every client that opens it.
     static func viewport(of board: BoardID) -> URL {
         support.appendingPathComponent("viewport", isDirectory: true).appendingPathComponent("\(board).json")
     }
-    /// The app's own settings (`ChromeTextScale`).
     static let uiSettings = support.appendingPathComponent("ui-settings.json")
+    static let clientID = support.appendingPathComponent("client-id")
     /// easl › Check for Updates…'s downloads (`Updater`): one folder per version with the zip,
     /// the unpacked app, the app it replaced and the helper's result, deleted at the next launch.
     static let updates = support.appendingPathComponent("updates", isDirectory: true)
@@ -82,9 +94,16 @@ enum AppPaths {
         return (["/opt/homebrew/bin/zmx", "/usr/local/bin/zmx"] + path).first { FileManager.default.isExecutableFile(atPath: $0) }
     }()
 
-    /// Where zmx writes each session's log (`<session>.log`): `$XDG_STATE_HOME/zmx/logs`, else
-    /// `~/.local/state/zmx/logs`. easl deletes its sessions' logs (`Housekeeping`).
+    /// This development home's zmx socket directory. Nil for the installed app.
+    static let devZmxDir: String? = {
+        guard let home = ProcessInfo.processInfo.environment["EASL_HOME"] else { return nil }
+        return ZmxIsolation.layout(home: home)?.zmxDir
+    }()
+
+    /// Development logs follow the forced zmx namespace. Installed launches keep
+    /// the account's XDG state location, as their tile attach strips inherited ZMX_DIR.
     static let zmxLogs: URL = {
+        if let forced = devZmxDir { return URL(fileURLWithPath: forced, isDirectory: true).appendingPathComponent("logs", isDirectory: true) }
         let state = ProcessInfo.processInfo.environment["XDG_STATE_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/state", isDirectory: true)
         return state.appendingPathComponent("zmx/logs", isDirectory: true)

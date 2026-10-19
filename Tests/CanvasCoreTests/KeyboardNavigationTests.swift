@@ -90,6 +90,19 @@ struct KeyboardNavigationTests {
         #expect(momentum.owner(of: .began, dx: 0, dy: 0, tileTakes: true) == nil, "began resets the owner")
     }
 
+    @Test func aMiddleDragPansWithThePointerOnceItMoves() {
+        var pan = CanvasDragPan(at: CGPoint(x: 100, y: 100))
+        #expect(pan.move(to: CGPoint(x: 101, y: 101)) == nil, "a jitter under the threshold is still a click")
+        #expect(!pan.panning)
+        #expect(pan.move(to: CGPoint(x: 110, y: 90)) == CGSize(width: 10, height: 10), "the first pan step counts from the press, so the board keeps up with the pointer")
+        #expect(pan.panning)
+        #expect(pan.move(to: CGPoint(x: 105, y: 95)) == CGSize(width: -5, height: -5), "then from the last step; window y is up, a pan's y is down")
+        #expect(pan.move(to: CGPoint(x: 105, y: 95)) == .zero, "once panning, any move pans, however small")
+        var still = CanvasDragPan(at: .zero)
+        #expect(still.move(to: CGPoint(x: 2, y: 2)) == nil)
+        #expect(!still.panning, "a press that never passes the threshold stays a click for what's under it")
+    }
+
     @Test func arrowNeighborPrefersTheSameRowThenTheNearest() {
         let from = CGRect(x: 0, y: 0, width: 400, height: 300)
         let frames = [

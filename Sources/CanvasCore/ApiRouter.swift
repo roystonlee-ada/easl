@@ -8,22 +8,35 @@ public final class BoardRegistry {
     public var frontmost: BoardID?
     public let store: BoardStore
     private var subscribers: [(connection: SocketServer.Connection, board: BoardID?, events: Set<String>?)] = []
+    private var closedWindows: Set<BoardID> = []
+    private var closedComposerReceipts: [BoardID: [ComposerNotice]] = [:]
     /// App-level observer for every board's events (UI reconciliation). Socket subscribers are fed separately.
     public var onEvent: ((Board, BoardEvent) -> Void)?
     /// The router's own observer (agent.wait), kept apart from the app-level hook.
     var routerHook: ((Board, BoardEvent) -> Void)?
     /// The router's handler of messages that bounced on any open board (`Board.onMessagesBounced`).
     var messagesBounced: ((Board, MessageBounce) -> Void)?
+    var didClose: ((Board) -> Void)?
+    var terminalsEnded: (([CanvasObject]) -> Void)?
     /// Terminal tiles deleted for good on any open board (`Board.onTerminalsEnded`), as they last
     /// were: the app ends their sessions.
     public var onTerminalsEnded: ((Board, [CanvasObject]) -> Void)?
     /// Where agent integrations spool the reports they couldn't deliver (`AgentReportSpool`);
     /// nil replays nothing.
     public let agentReports: URL?
+    /// This Mac, the drawing machine of every browser tile on the boards it hosts
+    /// (`Board.hostMachine`); nil when the app home has no machine identity.
+    public var drawingMachine: DrawingMachine? {
+        didSet { for board in boards.values { board.hostMachine = drawingMachine } }
+    }
+    /// The host's `archiveAfter` for new questions that name none, on every board it opens
+    /// (`Board.defaultQuestionArchiveAfter`): the app's `UISettings.questionArchiveAfter`.
+    private let defaultQuestionArchiveAfter: TimeInterval
 
-    public init(store: BoardStore = BoardStore(), agentReports: URL? = nil) {
+    public init(store: BoardStore = BoardStore(), agentReports: URL? = nil, defaultQuestionArchiveAfter: TimeInterval = QuestionSpec.defaultArchiveAfter) {
         self.store = store
         self.agentReports = agentReports
+        self.defaultQuestionArchiveAfter = defaultQuestionArchiveAfter
     }
 
     /// The board for a directory: its repository's board (rooted at the repository's canonical
@@ -34,32 +47,39 @@ public final class BoardRegistry {
         let worktree = GitWorktree.containing(root.standardizedFileURL.path)
         let id = worktree.map { BoardStore.repoID(commonDir: $0.commonDir) } ?? BoardStore.pathID(root)
         if let existing = boards[id] {
+            setWindowOpen(true, board: existing.id)
             if let worktree { existing.opened(from: worktree) }
             return existing
         }
         let board = store.load(root: worktree.map { URL(fileURLWithPath: $0.canonicalRoot) } ?? root, id: id, repo: worktree?.commonDir)
+        board.composerReceipts = closedComposerReceipts.removeValue(forKey: id) ?? []
         if let worktree { board.opened(from: worktree) }
         board.onEvent = { [weak self, weak board] event in
             guard let self, let board else { return }
             self.onEvent?(board, event)
             self.routerHook?(board, event)
-            self.broadcast(event, board: board.id)
+            self.broadcast(event.name, data: event.data, board: board.id)
         }
         board.onTerminalsEnded = { [weak self, weak board] ended in
             guard let self, let board else { return }
+            self.terminalsEnded?(ended)
             self.onTerminalsEnded?(board, ended)
         }
         board.onMessagesBounced = { [weak self, weak board] bounce in
             guard let self, let board else { return }
             self.messagesBounced?(board, bounce)
         }
+        board.hostMachine = drawingMachine
+        board.defaultQuestionArchiveAfter = defaultQuestionArchiveAfter
         boards[id] = board
         board.activity.record(.restart, actor: .system, rev: board.revision,
                               summary: "easl started (pid \(ProcessInfo.processInfo.processIdentifier)); board opened with \(board.objects.count) objects")
         frontmost = frontmost ?? id
         replayAgentReports(on: board)
-        // Questions that expired while the board was closed expire now.
+        // Questions that expired while the board was closed expire now; closed ones archive once
+        // what is left of their delay runs out (`BoardStore.load` archived those already past it).
         board.scheduleQuestionExpiry()
+        broadcast("board.opened", data: .object([:]), board: board.id)
         return board
     }
 
@@ -71,8 +91,8 @@ public final class BoardRegistry {
         guard !tiles.isEmpty else { return }
         Task { @MainActor [weak board] in
             let entries = await offPool { AgentReportSpool.read(from: directory, tiles: tiles) }
-            guard !entries.isEmpty else { return }
-            board?.replay(entries)
+            guard let board, self.boards[board.id] === board, !entries.isEmpty else { return }
+            board.replay(entries)
             await offPool { AgentReportSpool.remove(entries) }
         }
     }
@@ -84,9 +104,33 @@ public final class BoardRegistry {
         boards[id] ?? boards.values.first { $0.repo?.merged?.contains(id) == true }
     }
 
-    public func close(_ id: BoardID) {
-        if let board = boards.removeValue(forKey: id) { store.save(board) }
-        if frontmost == id { frontmost = boards.keys.first }
+    public func setWindowOpen(_ open: Bool, board id: BoardID) {
+        guard let board = board(id: id) else { return }
+        let changed = open ? closedWindows.remove(board.id) != nil : closedWindows.insert(board.id).inserted
+        if changed { broadcast(open ? "board.opened" : "board.closed", data: .object([:]), board: board.id) }
+    }
+
+    func windowIsOpen(_ id: BoardID) -> Bool { !closedWindows.contains(id) }
+
+    public func close(_ id: BoardID, beforeEviction: () throws -> Void = {}) throws {
+        guard let board = board(id: id) else { throw ApiRouter.Failure("not_found", "board \(id)") }
+        do {
+            try store.saveChecked(board)
+            try beforeEviction()
+        } catch let failure as ApiRouter.Failure {
+            throw failure
+        } catch {
+            throw ApiRouter.Failure("unavailable", "cannot save board \(board.id) before closing: \(error.localizedDescription)")
+        }
+        board.returnRemoteComposerPrompts()
+        if !board.composerReceipts.isEmpty { closedComposerReceipts[board.id] = board.composerReceipts }
+        boards.removeValue(forKey: board.id)
+        board.deactivate()
+        if frontmost == board.id { frontmost = boards.keys.sorted().first }
+        didClose?(board)
+        if closedWindows.remove(board.id) == nil {
+            broadcast("board.closed", data: .object([:]), board: board.id)
+        }
     }
 
     public func board(containing object: ObjectID) -> Board? {
@@ -97,17 +141,23 @@ public final class BoardRegistry {
         subscribers.append((connection, board, events.map(Set.init)))
     }
 
-    private func broadcast(_ event: BoardEvent, board: BoardID) {
+    /// Whether `connection` subscribed to `event` on `board` itself, not on every board: a
+    /// browser stream's private events (`SurfaceEvent`) go to its own connection only once it has.
+    public func subscribes(_ connection: SocketServer.Connection, to event: String, on board: BoardID) -> Bool {
+        subscribers.contains { $0.connection === connection && $0.board == board && ($0.events?.contains(event) ?? true) }
+    }
+
+    private func broadcast(_ name: String, data: JSONValue, board: BoardID) {
         subscribers.removeAll { !$0.connection.isOpen }
         Metrics.shared.gauge("events.subscribers", Double(subscribers.count))
         let receivers = subscribers.filter { subscriber in
-            (subscriber.board == nil || subscriber.board == board) && (subscriber.events?.contains(event.name) ?? true)
+            (subscriber.board == nil || subscriber.board == board) && (subscriber.events?.contains(name) ?? true)
         }
         guard !receivers.isEmpty else { return }
         // Encoded once for every subscriber (an html tile's update carries its whole page).
-        let message: JSONValue = .object(["event": .string(event.name), "board": .string(board), "data": event.data])
+        let message: JSONValue = .object(["event": .string(name), "board": .string(board), "data": data])
         guard let line = try? JSONEncoder().encode(message) else { return }
-        Metrics.shared.record("event.\(event.name)", bytes: (line.count + 1) * receivers.count)
+        Metrics.shared.record("event.\(name)", bytes: (line.count + 1) * receivers.count)
         for subscriber in receivers { subscriber.connection.send(encoded: line) }
     }
 }
@@ -175,8 +225,8 @@ public final class ApiRouter {
     /// reported since it loaded, and the log of the page easl last released; nil without the tile.
     public var pageReport: ((Board, ObjectID) async -> PageReport?)?
     /// A note tile's anchored fences resolved against disk now, with the text it captured, by
-    /// fence key (the tile shows them too); nil without the tile, and `object.get` resolves them
-    /// itself.
+    /// fence key (the tile shows them too); nil without the tile. `object.get` resolves them
+    /// itself inside the board's areas, and reports the tile's only for fences those permit.
     public var noteExcerpts: ((Board, ObjectID) async -> [String: NoteExcerpt]?)?
     /// A code tile's range resolved against disk now with the text the tile last found there
     /// (it may re-anchor the range first); nil without the tile, and `object.get` resolves the
@@ -191,13 +241,32 @@ public final class ApiRouter {
     public var refreshDiagram: ((Board, ObjectID) async throws -> JSONValue)?
     /// Opens a directory's board in the UI (a tab of the frontmost board window), selecting its tab when asked.
     public var openBoard: ((URL, _ select: Bool) -> Board)?
+    /// Closes a local board or a remote viewer tab without showing the manual close sheet.
+    /// Nil preserves sessions; a remote tab refuses any explicit sessions choice.
+    public var closeBoard: ((BoardID, _ endSessions: Bool?) async throws -> BoardCloseResult)?
     /// Opens `board` on another Mac in the UI as File › Open Remote… does, `host` found among the
     /// picker's hosts (`RemoteHost.target`): a tab of the frontmost board window, selected when
     /// asked; a tab open already is answered (and selected when asked), never opened twice.
     /// Throws the picker's failures: `unavailable` (the host can't be reached or its easl doesn't
     /// answer), `not_found` (the host has no such board open), `ambiguous` (a name two hosts have).
     public var openRemoteBoard: ((_ host: String, _ board: BoardID, _ select: Bool) async throws -> OpenedRemoteBoard)?
-    public static let schemaVersion = 1
+    /// The app's browser surfaces (`surface.*`, `SurfaceRequest`): a `surface.stream` reaches it
+    /// only for a browser tile on an open board whose `surface.frame` this connection subscribed
+    /// to; every other request names a stream the app checks belongs to this connection.
+    public var surface: ((SurfaceRequest, SocketServer.Connection) async throws -> JSONValue)?
+    public struct UpdateReply {
+        public let value: JSONValue
+        public let sent: (@MainActor (Bool) -> Void)?
+
+        public init(value: JSONValue, sent: (@MainActor (Bool) -> Void)? = nil) {
+            self.value = value
+            self.sent = sent
+        }
+    }
+
+    /// Checks or installs an update of the running Mac app.
+    public var updateApp: ((String) async throws -> UpdateReply)?
+    public static let schemaVersion = ApiParams.schemaVersion
     static let readLinesDefault = 100
     static let readLinesMax = 2000
     /// How much of a terminal `agent.prompt` remembers from just before it submits: enough to
@@ -240,6 +309,7 @@ public final class ApiRouter {
     /// Terminals agent.restart is killing and relaunching: until it is done nothing else reaches
     /// them (agent.prompt is refused, agent.inbox offers nothing, another restart is refused).
     var restarting: Set<ObjectID> = []
+    private var closingBoards: Set<BoardID> = []
     /// Terminals `agent.prompt` is typing into now (its checks, the screen reads, the paste and
     /// Enter), with how many prompts: an unforced restart waits for them (`promptPending`).
     private var typing: [ObjectID: Int] = [:]
@@ -288,10 +358,12 @@ public final class ApiRouter {
         self.registry = registry
         registry.routerHook = { [weak self] board, event in self?.observe(event, on: board) }
         registry.messagesBounced = { [weak self] board, bounce in self?.bounce(bounce, on: board) }
+        registry.didClose = { [weak self] board in self?.closed(board) }
+        registry.terminalsEnded = { [weak self] ended in self?.terminalsEnded(ended) }
     }
 
-    /// Entry point for SocketServer. Returns the response line, or nil when the reply is deferred
-    /// (agent.wait) or the connection became an event stream.
+    /// Entry point for SocketServer. Returns the response line, or nil when the router owns its
+    /// delivery, the reply is deferred, or the connection became an event stream.
     public func handle(_ request: JSONValue, connection: SocketServer.Connection) async -> JSONValue? {
         let id = request["id"] ?? .null
         guard let method = request["method"]?.string else {
@@ -307,6 +379,7 @@ public final class ApiRouter {
                 connection.send(.object(["id": id, "ok": .bool(true), "result": .object([:])]))
                 return nil
             }
+            if let request = try SurfaceRequest(method: method, params: params) { return Self.ok(id, try await serveSurface(request, connection)) }
             if method == "agent.wait" { return try wait(id, params, connection) }
             if method == "agent.inbox" { return try await inbox(id, params, connection) }
             if method == "agent.read" { return Self.ok(id, try await read(params)) }
@@ -319,7 +392,20 @@ public final class ApiRouter {
             if method == "object.get" { return Self.ok(id, try await get(params)) }
             if method == "object.find" { return Self.ok(id, try await find(params)) }
             switch method {
+            case "app.update":
+                guard let mode = params["mode"]?.string, mode == "check" || mode == "install" else {
+                    throw Failure("invalid_params", "mode must be check or install")
+                }
+                guard let updateApp else { throw Failure("unavailable", "app.update needs the easl app") }
+                let reply = try await updateApp(mode)
+                let response = Self.ok(id, reply.value)
+                guard let sent = reply.sent else { return response }
+                connection.send(response, timeout: 30) { written in
+                    Task { @MainActor in sent(written) }
+                }
+                return nil
             case "board.open_remote": return Self.ok(id, try await openRemote(params))
+            case "board.close": return Self.ok(id, try await close(params))
             case "object.measure": return Self.ok(id, try await measure(params))
             case "object.reload": return Self.ok(id, try await reload(params))
             case "object.batch": return Self.ok(id, try await batch(params))
@@ -349,23 +435,32 @@ public final class ApiRouter {
             default: break
             }
             return Self.ok(id, try dispatch(method, params))
-        } catch let failure as Failure {
-            return Self.error(id, failure)
-        } catch let error as BoardError {
-            switch error {
-            case .notFound(let message): return Self.error(id, Failure("not_found", message))
-            case .conflict(let message): return Self.error(id, Failure("conflict", message))
-            case .invalidParams(let message): return Self.error(id, Failure("invalid_params", message))
-            }
-        } catch let failure as ObjectMeasure.Failure {
-            switch failure {
-            case .unsupported(let message): return Self.error(id, Failure("unsupported", message))
-            case .unavailable(let message): return Self.error(id, Failure("unavailable", message))
-            case .notFound(let message): return Self.error(id, Failure("not_found", message))
-            case .invalidParams(let message): return Self.error(id, Failure("invalid_params", message))
-            }
         } catch {
-            return Self.error(id, Failure("invalid_params", String(describing: error)))
+            return Self.error(id, Self.failure(for: error))
+        }
+    }
+
+    /// What a method's error answers: a `Failure` as it is, a board's or a measurement's under
+    /// its code, anything else `invalid_params`.
+    static func failure(for error: Error) -> Failure {
+        switch error {
+        case let failure as Failure:
+            return failure
+        case let error as BoardError:
+            switch error {
+            case .notFound(let message): return Failure("not_found", message)
+            case .conflict(let message): return Failure("conflict", message)
+            case .invalidParams(let message): return Failure("invalid_params", message)
+            }
+        case let failure as ObjectMeasure.Failure:
+            switch failure {
+            case .unsupported(let message): return Failure("unsupported", message)
+            case .unavailable(let message): return Failure("unavailable", message)
+            case .notFound(let message): return Failure("not_found", message)
+            case .invalidParams(let message): return Failure("invalid_params", message)
+            }
+        default:
+            return Failure("invalid_params", String(describing: error))
         }
     }
 
@@ -397,6 +492,20 @@ public final class ApiRouter {
         var result = result
         if !warnings.isEmpty { result["warnings"] = .array(warnings.map(JSONValue.string)) }
         return .object(result)
+    }
+
+    // MARK: surface.*
+
+    private func serveSurface(_ request: SurfaceRequest, _ connection: SocketServer.Connection) async throws -> JSONValue {
+        guard let surface else { throw Failure("unavailable", "browser surfaces need the easl app") }
+        if case .stream(let tile, _, _) = request {
+            let board = try board(forObject: tile)
+            guard board.objects[tile]?.type == .browser else { throw Failure("not_found", "\(tile) is not a browser tile") }
+            guard registry.subscribes(connection, to: "surface.frame", on: board.id) else {
+                throw Failure("invalid_params", "subscribe this connection to surface.frame on board \(board.id) (events.subscribe) before surface.stream")
+            }
+        }
+        return try await surface(request, connection)
     }
 
     // MARK: agent.wait
@@ -509,7 +618,7 @@ public final class ApiRouter {
     private func recheck(_ token: UUID) {
         guard let index = waiters.firstIndex(where: { $0.token == token }) else { return }
         let waiter = waiters[index]
-        guard let (board, _) = try? agentTile(waiter.tile) else { return }
+        guard let (board, _) = try? agentTileIncludingClosing(waiter.tile) else { return }
         guard let reply = reply(to: waiter, on: board) else {
             if let prompted = pendingPrompts[waiter.tile] { recheck(token, at: prompted.addingTimeInterval(promptStartGrace)) }
             return
@@ -530,6 +639,71 @@ public final class ApiRouter {
         waiter.connection.send(Self.error(waiter.id, Failure("timeout", "\(waiter.tile) did not reach \(waiter.until.sorted().joined(separator: "|")) in time")))
     }
 
+    private func terminalsEnded(_ ended: [CanvasObject]) {
+        let tiles = Set(ended.lazy.map(\.id))
+        inboxWaiters.removeAll { waiter in
+            guard tiles.contains(waiter.tile) else { return !waiter.connection.isOpen }
+            waiter.connection.send(Self.error(waiter.id, Failure("not_found", "terminal \(waiter.tile) was closed")))
+            return true
+        }
+        messageHolds = messageHolds.filter { !tiles.contains($0.key.tile) }
+    }
+
+    private func closed(_ board: Board) {
+        let tiles = Set(board.objects.values.filter { $0.type == .terminal }.map(\.id))
+        waiters.removeAll { waiter in
+            guard tiles.contains(waiter.tile) else { return !waiter.connection.isOpen }
+            waiter.connection.send(Self.error(waiter.id, Failure("not_found", "board \(board.id) was closed")))
+            return true
+        }
+        inboxWaiters.removeAll { waiter in
+            guard tiles.contains(waiter.tile) else { return !waiter.connection.isOpen }
+            waiter.connection.send(Self.error(waiter.id, Failure("not_found", "board \(board.id) was closed")))
+            return true
+        }
+        messageHolds = messageHolds.filter { !tiles.contains($0.key.tile) }
+        for tile in tiles { forgetPrompts(to: tile) }
+    }
+
+    private func close(_ p: JSONValue) async throws -> JSONValue {
+        guard p.object != nil else { throw Failure("invalid_params", "board.close params must be an object") }
+        let endSessions: Bool?
+        if let value = p["endSessions"] {
+            guard let choice = value.bool else { throw Failure("invalid_params", "endSessions must be a boolean") }
+            endSessions = choice
+        } else {
+            endSessions = nil
+        }
+        let id: BoardID
+        if let value = p["board"] {
+            guard let requested = value.string, !requested.isEmpty else { throw Failure("invalid_params", "board must be a board id") }
+            id = registry.board(id: requested)?.id ?? requested
+        } else {
+            id = try board(p).id
+        }
+        guard !closingBoards.contains(id) else { throw Failure("conflict", "board \(id) is already closing") }
+        if let board = registry.boards[id],
+           let tile = board.objects.values.first(where: { $0.type == .terminal && restarting.contains($0.id) }) {
+            throw Self.restartingFailure(tile.id)
+        }
+        closingBoards.insert(id)
+        defer { closingBoards.remove(id) }
+        if let closeBoard {
+            do {
+                return try await closeBoard(id, endSessions).json
+            } catch let failure as Failure {
+                throw failure
+            } catch {
+                throw Failure("unavailable", "cannot close board \(id): \(error.localizedDescription)")
+            }
+        }
+        guard let board = registry.boards[id] else { throw Failure("not_found", "board \(id)") }
+        if endSessions == true { throw Failure("unsupported", "ending sessions needs the app UI") }
+        let result = BoardCloseResult(board: board)
+        try registry.close(board.id)
+        return result.json
+    }
+
     // MARK: Agents
 
     static func state(of terminal: CanvasObject) -> String {
@@ -539,16 +713,26 @@ public final class ApiRouter {
     /// The terminal `target` addresses (AgentAddress: a tile id, `name` or `name@board`) on the
     /// open boards; a bare name on `caller`'s board first.
     func agentTile(_ target: String, caller: ObjectID? = nil) throws -> (Board, CanvasObject) {
+        let (board, terminal) = try agentTileIncludingClosing(target, caller: caller)
+        return (try available(board), terminal)
+    }
+
+    private func agentTileIncludingClosing(_ target: String, caller: ObjectID? = nil) throws -> (Board, CanvasObject) {
         try AgentAddress.resolve(target, caller: caller, boards: Array(registry.boards.values))
     }
 
     func agentEntry(_ terminal: CanvasObject, on board: Board) -> JSONValue {
+        Self.agentEntry(terminal, on: board, among: Array(registry.boards.values), status: terminalStatus?(board, terminal.id))
+    }
+
+    /// A terminal's `agent` entry: `status` is what its tile knows now, `boards` what its address
+    /// is told apart among.
+    static func agentEntry(_ terminal: CanvasObject, on board: Board, among boards: [Board], status: TerminalStatus?) -> JSONValue {
         let agent = terminal.props["agent"]
-        let status = terminalStatus?(board, terminal.id)
         let aliases = board.aliases(of: terminal.id)
         let entry: [String: JSONValue] = [
             "tile": .string(terminal.id), "board": .string(board.id), "root": .string(board.root.path),
-            "address": .string(AgentAddress.address(of: terminal, on: board, among: Array(registry.boards.values))),
+            "address": .string(AgentAddress.address(of: terminal, on: board, among: boards)),
             "kind": agent?["kind"] ?? .string("unknown"),
             "name": terminal.props["name"] ?? .null,
             "aliases": aliases.isEmpty ? .null : .array(aliases.map(JSONValue.string)),
@@ -559,7 +743,7 @@ public final class ApiRouter {
             "lifecycle": terminal.props["lifecycle"] ?? .object(["state": .string(LifecycleState.unknown.rawValue)]),
             "lastCommand": status?.lastCommand.map { $0.command.json(finishedAt: $0.finishedAt) } ?? .null,
         ]
-        return .object(entry.merging(agentControlFields(terminal, status: status)) { _, new in new }.filter { $0.value != .null })
+        return .object(entry.merging(agentControlFields(terminal, on: board, status: status)) { _, new in new }.filter { $0.value != .null })
     }
 
     /// `agent.read`: the tail of the session text, or with `since: "prompt"` what the terminal
@@ -570,55 +754,89 @@ public final class ApiRouter {
     private func read(_ p: JSONValue) async throws -> JSONValue {
         let (board, terminal) = try agentTile(try string(p, "target"), caller: p["caller"]?.string)
         if p["final"]?.bool == true { return try finalAnswer(of: terminal, on: board, p) }
-        let since = p["since"]?.string
-        guard since == nil || since == "prompt" else { throw Failure("invalid_params", "since must be \"prompt\"") }
-        var block: Int?
-        if let value = p["block"], value != .null {
-            if value.string == "last" {
-                block = -1
-            } else if let number = value.number, number <= -1, number == number.rounded(), number >= -Double(TerminalCommandLog.capacity) {
-                block = Int(number)
-            } else {
-                throw Failure("invalid_params", "block must be \"last\" or a whole number from -1 (the last command) to -\(TerminalCommandLog.capacity): -2 is the one before the last")
-            }
-        }
-        guard block == nil || since == nil else { throw Failure("invalid_params", "since and block don't combine: block reads a command's output, since the reply to the last agent.prompt") }
-        let requested = p["lines"]?.int ?? (since == nil && block == nil ? Self.readLinesDefault : Self.readLinesMax)
-        guard requested >= 1 else { throw Failure("invalid_params", "lines must be at least 1") }
-        if let block { return try await readBlock(board, terminal, block, lines: min(requested, Self.readLinesMax)) }
+        let request = try ReadRequest(p)
+        if let block = request.block { return try await readBlock(board, terminal, block, lines: request.lines) }
         guard let readTerminal else { throw Failure("unsupported", "reading terminals needs the app UI") }
         var mark: TerminalTail.Tail?
-        if since != nil {
+        if request.sincePrompt {
             guard let found = promptMarks[terminal.id] else {
                 throw Failure("not_found", "no agent.prompt has reached terminal \(terminal.id) since easl started; read with lines instead")
             }
             mark = found
         }
-        // A reply is compared against the screen it followed, so it reads the most there is.
-        guard let tail = await readTerminal(board, terminal.id, mark == nil ? min(requested, Self.readLinesMax) : Self.readLinesMax) else {
+        guard let tail = await readTerminal(board, terminal.id, request.reading) else {
             throw Failure("unavailable", "terminal \(terminal.id) has no running session")
         }
-        var result: [String: JSONValue] = [:]
-        var shown = tail
-        if let mark {
-            let boundary = tail.boundary(after: mark)
-            let reply = tail.rows(from: boundary)
-            shown = reply.suffix(min(requested, Self.readLinesMax))
-            // Cut by `lines`, or the reply is longer than the tail reaches.
-            result["truncated"] = .bool(shown.lines < reply.lines || (tail.positions.first ?? 0) > boundary)
-        }
+        var result = request.shown(tail, after: mark)
         let current = board.objects[terminal.id] ?? terminal
         result["agent"] = agentEntry(current, on: board)
-        result["text"] = .string(shown.text)
-        result["lines"] = .number(Double(shown.lines))
         return .object(result)
+    }
+
+    /// `agent.read`'s screen modes as asked (`lines`, `since: "prompt"`, `block`), checked.
+    @MainActor
+    struct ReadRequest {
+        /// How many lines to answer with, at most `readLinesMax`.
+        var lines: Int
+        /// What followed the last `agent.prompt` (`since: "prompt"`).
+        var sincePrompt: Bool
+        /// A finished command's output instead, counted back from the last (-1).
+        var block: Int?
+
+        init(_ p: JSONValue) throws {
+            let since = p["since"]?.string
+            guard since == nil || since == "prompt" else { throw Failure("invalid_params", "since must be \"prompt\"") }
+            var block: Int?
+            if let value = p["block"], value != .null {
+                if value.string == "last" {
+                    block = -1
+                } else if let number = value.number, number <= -1, number == number.rounded(), number >= -Double(TerminalCommandLog.capacity) {
+                    block = Int(number)
+                } else {
+                    throw Failure("invalid_params", "block must be \"last\" or a whole number from -1 (the last command) to -\(TerminalCommandLog.capacity): -2 is the one before the last")
+                }
+            }
+            guard block == nil || since == nil else { throw Failure("invalid_params", "since and block don't combine: block reads a command's output, since the reply to the last agent.prompt") }
+            let requested = p["lines"]?.int ?? (since == nil && block == nil ? ApiRouter.readLinesDefault : ApiRouter.readLinesMax)
+            guard requested >= 1 else { throw Failure("invalid_params", "lines must be at least 1") }
+            lines = min(requested, ApiRouter.readLinesMax)
+            sincePrompt = since != nil
+            self.block = block
+        }
+
+        /// How many of the session's last lines to read: a reply is compared against the screen it
+        /// followed, so it reads the most there is.
+        var reading: Int { sincePrompt ? ApiRouter.readLinesMax : lines }
+
+        /// The answer's `text` and `lines` from `tail`: what followed `mark` (the terminal's text
+        /// just before the last prompt), with `truncated`, when given.
+        func shown(_ tail: TerminalTail.Tail, after mark: TerminalTail.Tail?) -> [String: JSONValue] {
+            var result: [String: JSONValue] = [:]
+            var shown = tail
+            if let mark {
+                let boundary = tail.boundary(after: mark)
+                let reply = tail.rows(from: boundary)
+                shown = reply.suffix(lines)
+                // Cut by `lines`, or the reply is longer than the tail reaches.
+                result["truncated"] = .bool(shown.lines < reply.lines || (tail.positions.first ?? 0) > boundary)
+            }
+            result["text"] = .string(shown.text)
+            result["lines"] = .number(Double(shown.lines))
+            return result
+        }
     }
 
     /// `agent.read` `block`: a finished command's output (its last `lines` lines) with what ran,
     /// its exit status and duration.
     private func readBlock(_ board: Board, _ terminal: CanvasObject, _ index: Int, lines limit: Int) async throws -> JSONValue {
         guard let readTerminalBlock else { throw Failure("unsupported", "reading terminals needs the app UI") }
-        let block = try await readTerminalBlock(board, terminal.id, index)
+        var result = Self.blockResult(try await readTerminalBlock(board, terminal.id, index), lines: limit)
+        result["agent"] = agentEntry(board.objects[terminal.id] ?? terminal, on: board)
+        return .object(result)
+    }
+
+    /// `agent.read` `block`'s answer for `block`, its output cut to the last `limit` lines.
+    static func blockResult(_ block: (command: TerminalCommand, output: String), lines limit: Int) -> [String: JSONValue] {
         let output = TerminalExcerpt.lines(block.output)
         let shown = output.suffix(limit)
         var result: [String: JSONValue] = [
@@ -627,8 +845,7 @@ public final class ApiRouter {
             "command": block.command.json(),
         ]
         if shown.count < output.count { result["truncated"] = .bool(true) }
-        result["agent"] = agentEntry(board.objects[terminal.id] ?? terminal, on: board)
-        return .object(result)
+        return result
     }
 
     /// `agent.prompt`: to a terminal whose integration takes messages (`PromptTarget.takesMessages`)
@@ -646,13 +863,10 @@ public final class ApiRouter {
         let text = try string(p, "text")
         let mentions = p["mentions"]?.array ?? []
         if p["composer"]?.bool == true {
-            // A composer in another app (a remote board's viewer): what this app's composer sends.
             let answer = p["answer"]?.bool == true
-            let given: [Mention] = answer ? [] : try mentions.map { json in
-                let target = try HandoffMention(json: json).target(on: board)
-                return Mention(id: IDs.make("men"), target: target, label: MentionContext.label(for: target, on: board), stagedAt: Date())
-            }
-            return try await submitPrompt(text, to: resolved, on: board, attached: .composer(given, answer: answer), caller: nil, force: false)
+            let staged = try Self.stagedMentions(p, on: board)
+            let viewer = try Self.composerViewer(p, staged: staged)
+            return try await submitPrompt(text, to: resolved, on: board, attached: .composer(staged, answer: answer, viewer: viewer), caller: nil, force: false)
         }
         let when: AgentMessage.When
         switch p["when"] {
@@ -703,6 +917,7 @@ public final class ApiRouter {
         guard let current = board.objects[terminal.id] else { throw Failure("not_found", "terminal \(terminal.id) was closed") }
         if let queued = Self.queued(id, for: terminal.id, on: board) { return try messageResult(queued, to: current, on: board, duplicate: true) }
         if restarting.contains(terminal.id) { throw Self.restartingFailure(terminal.id) }
+        try available(board)
         if board.agentExited(terminal.id) { throw Self.agentExited(current) }
         guard PromptTarget.takesMessages(current), board.agentSession(of: terminal.id) == session else {
             throw Failure("unavailable", "\(terminal.id)'s agent session ended while the message was being sent (its agent was released, exited, "
@@ -822,13 +1037,49 @@ public final class ApiRouter {
         if p["answer"]?.bool == true, !composer {
             throw Failure("invalid_params", "answer is the user's answer from a composer: it needs composer: true (an agent or script sends force: true instead)")
         }
-        guard composer else { return }
+        if !composer {
+            if p["staged"].map({ $0 != .null }) == true { throw Failure("invalid_params", "staged is only for a composer's prompt") }
+            if p["viewer"].map({ $0 != .null }) == true { throw Failure("invalid_params", "viewer is only for a composer's prompt") }
+            return
+        }
+        if p["mentions"].map({ $0 != .null }) == true { throw Failure("invalid_params", "a composer's prompt takes staged mentions, not mentions") }
+        if p["answer"]?.bool == true, let staged = p["staged"]?.array, !staged.isEmpty {
+            throw Failure("invalid_params", "an answer takes no staged mentions")
+        }
         if p["caller"].map({ $0 != .null }) == true { throw Failure("invalid_params", "a composer's prompt is the user's: it takes no caller") }
         if p["from"].map({ $0 != .null }) == true { throw Failure("invalid_params", "a composer's prompt is the user's: it takes no from") }
         if p["when"].map({ $0 != .null }) == true { throw Failure("invalid_params", "a composer's prompt is typed as the user sends it: it takes no when") }
         if p["force"]?.bool == true { throw Failure("invalid_params", "a composer's prompt never forces: answer: true answers a blocked target") }
     }
 
+    static func stagedMentions(_ p: JSONValue, on board: Board) throws -> [Mention] {
+        guard let raw = p["staged"], raw != .null else { return [] }
+        guard let items = raw.array else { throw Failure("invalid_params", "staged must be a list of mentions") }
+        return try items.map { input in
+            var json = input
+            if let stamp = input["stagedAt"]?.string {
+                guard let date = (try? Date(stamp, strategy: .iso8601))
+                    ?? (try? Date(stamp, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true))) else {
+                    throw Failure("invalid_params", "a staged mention needs a valid stagedAt time")
+                }
+                json = input.merging(.object(["stagedAt": .number(date.timeIntervalSinceReferenceDate)]))
+            }
+            let mention: Mention
+            do { mention = try json.decode(Mention.self) } catch {
+                throw Failure("invalid_params", "a staged mention needs id, target, label, stagedAt and edited")
+            }
+            for id in mention.target.objectIDs where board.objects[id] == nil {
+                throw Failure("not_found", "object \(id)")
+            }
+            return mention
+        }
+    }
+
+    static func composerViewer(_ p: JSONValue, staged: [Mention]) throws -> String? {
+        let present = p["viewer"].map { $0 != .null } == true
+        if staged.isEmpty && !present { return nil }
+        return try ViewerEdit.viewer(p["viewer"])
+    }
     /// Messages whose receiver's agent session ended before its integration took them
     /// (`Board.endAgentSession`): never dropped silently. Each goes back to a sending terminal
     /// whose integration takes messages, as a message from easl ("undelivered to bob@canvas: its
@@ -858,7 +1109,7 @@ public final class ApiRouter {
     /// What goes with a prompt: an agent's `mentions` (`Board.handOff`), or the composer's.
     private enum Attached {
         case agent(() throws -> [MentionTarget])
-        case composer([Mention], answer: Bool)
+        case composer([Mention], answer: Bool, viewer: String?)
     }
 
     /// The composer's send to one terminal (docs/design.md, Composer): `agent.prompt` from the
@@ -873,7 +1124,7 @@ public final class ApiRouter {
     /// where the integration submits answers as prompts (`PromptTarget.answersAsPrompt`).
     public func composerPrompt(_ text: String, to terminal: ObjectID, on board: Board, mentions: [Mention], answer: Bool) async throws {
         guard let tile = board.objects[terminal], tile.type == .terminal else { throw Failure("not_found", "terminal \(terminal) was closed") }
-        _ = try await submitPrompt(text, to: tile, on: board, attached: .composer(answer ? [] : mentions, answer: answer), caller: nil, force: false)
+        _ = try await submitPrompt(text, to: tile, on: board, attached: .composer(answer ? [] : mentions, answer: answer, viewer: nil), caller: nil, force: false)
     }
 
     private func submitPrompt(_ text: String, to terminal: CanvasObject, on board: Board, attached: Attached, caller sender: ObjectID?, force: Bool) async throws -> JSONValue {
@@ -887,7 +1138,7 @@ public final class ApiRouter {
         }
         let session = board.agentSession(of: terminal.id)
         let answering: Bool
-        if case .composer(_, let answer) = attached { answering = answer } else { answering = false }
+        if case .composer(_, let answer, _) = attached { answering = answer } else { answering = false }
         if Self.state(of: terminal) == LifecycleState.blocked.rawValue, !force, !answering {
             let blocker = terminal.props["lifecycle"]?["message"]?.string.map { " (“\($0)”)" } ?? ""
             throw Failure("conflict", "\(terminal.id) is blocked, waiting on its user\(blocker): the prompt would go into that dialog. Leave it to the user. force: true types into the dialog and presses Return, which in an approval menu picks the highlighted option (usually allow), so never force an answer to an approval")
@@ -915,17 +1166,18 @@ public final class ApiRouter {
         let mentions: [MentionTarget]
         switch attached {
         case .agent(let parse): mentions = try parse()
-        case .composer(let given, _): mentions = given.map(\.target)
+        case .composer(let given, _, _): mentions = given.map(\.target)
         }
         if !mentions.isEmpty, !PromptTarget.drains(terminal) {
             throw Failure("unavailable", "\(terminal.id) runs no agent with an easl integration, so nothing there would take the mentions; name the objects in the text instead")
         }
-        if case .composer(let given, _) = attached, !given.isEmpty, PromptTarget.skipsDrain(text, in: terminal) {
+        if case .composer(let given, _, _) = attached, !given.isEmpty, PromptTarget.skipsDrain(text, in: terminal) {
             throw Failure("invalid_params", "a slash command or shell escape takes no mentions: its agent drains nothing for it")
         }
         let before = await readTerminal?(board, terminal.id, Self.promptMarkLines)
         guard let current = board.objects[terminal.id] else { throw Failure("not_found", "terminal \(terminal.id) was closed") }
         if restarting.contains(terminal.id) { throw Self.restartingFailure(terminal.id) }
+        try available(board)
         guard board.agentSession(of: terminal.id) == session else {
             throw Failure("unavailable", "\(terminal.id)'s agent session ended while the prompt was being sent (its agent was released, exited, "
                 + "restarted, or another session took the terminal), so nothing was typed; agent.list shows what runs there now")
@@ -935,11 +1187,11 @@ public final class ApiRouter {
         var queued: String?
         switch attached {
         case .agent:
-            let senderName = sender.flatMap { try? agentTile($0) }.map { PromptTarget.label($0.1, shownTitle: terminalStatus?($0.0, $0.1.id).title) }
+            let senderName = sender.flatMap { try? agentTileIncludingClosing($0) }.map { PromptTarget.label($0.1, shownTitle: terminalStatus?($0.0, $0.1.id).title) }
             handed = try board.handOff(mentions, to: terminal.id, from: sender, fromName: senderName)
-        case .composer(let given, let answer):
+        case .composer(let given, let answer, let viewer):
             if PromptTarget.drains(current), !PromptTarget.skipsDrain(text, in: current), answer ? PromptTarget.answersAsPrompt(current) : !given.isEmpty {
-                queued = board.queueComposerPrompt(text, to: terminal.id, mentions: given, answer: answer)
+                queued = board.queueComposerPrompt(text, to: terminal.id, mentions: given, answer: answer, viewer: viewer)
             }
         }
         // The paste and Enter: no restart starts until they are in (`pastingFailure`). Nothing
@@ -957,10 +1209,9 @@ public final class ApiRouter {
         // still in its turn as the text lands takes it into that turn (omp as a steering message
         // before the turn ends; Codex before its next tool call, or right after its last answer,
         // with one Stop for both): no report may come until that turn ends, which answers it.
-        let notifying = NotifyingAgent.reports(current)
-        let waitable = notifying || Self.state(of: current) != LifecycleState.unknown.rawValue
+        let waitable = Self.waitable(current)
         let midTurn = board.objects[terminal.id].map(Self.state) == LifecycleState.working.rawValue
-        if notifying { board.notifyingAgentSubmitted(terminal.id) } else if waitable, !midTurn { pendingPrompts[terminal.id] = Date() }
+        if NotifyingAgent.reports(current) { board.notifyingAgentSubmitted(terminal.id) } else if waitable, !midTurn { pendingPrompts[terminal.id] = Date() }
         promptMarks[terminal.id] = before ?? TerminalTail.Tail(rows: [], positions: [])
         var result: [String: JSONValue] = [
             "agent": agentEntry(current, on: board),
@@ -970,6 +1221,12 @@ public final class ApiRouter {
         ]
         if !handed.isEmpty { result["mentions"] = try JSONValue.encode(handed) }
         return .object(result)
+    }
+
+    /// Whether `agent.wait` can tell when a prompt typed into `terminal` is done: its agent reports
+    /// its turns, by lifecycle or by notification.
+    static func waitable(_ terminal: CanvasObject) -> Bool {
+        NotifyingAgent.reports(terminal) || state(of: terminal) != LifecycleState.unknown.rawValue
     }
 
     /// `agent.read` `final`: the answer the terminal's integration reported when its last turn
@@ -1018,19 +1275,34 @@ public final class ApiRouter {
     private func render(_ p: JSONValue) async throws -> JSONValue {
         let inline = p["inline"]?.bool == true
         if inline, p["out"] != nil { throw Failure("invalid_params", "inline returns the image in the reply and out writes it to a file: pass one of them") }
+        let (board, request) = try Self.renderRequest(p) { id in
+            if let id, p["board"] == nil { return try self.board(forObject: id) }
+            return try self.board(p)
+        }
+        let (format, out) = try Self.imageDestination(p, name: "render")
+        guard let renderView else { throw Failure("unsupported", "rendering needs the app UI") }
+        let output = try await renderView(board, request, format)
+        let image = inline ? Self.inlined(output) : try await Self.deliver(output, to: out)
+        return Self.rendered(output, image)
+    }
+
+    /// `view.render`'s params checked as the app checks them, as a request on the board `find`
+    /// gives for the first target id (nil for a rect): the router's own lookup, or the one board
+    /// a remote board's viewer answers for (`DelegatedCalls`).
+    static func renderRequest(_ p: JSONValue, board find: (ObjectID?) throws -> Board) throws -> (Board, RenderRequest) {
         let board: Board
         let target: RenderTarget
         switch p["target"] {
         case .string(let id)?:
-            board = try p["board"] == nil ? self.board(forObject: id) : self.board(p)
+            board = try find(id)
             target = .objects([id])
         case .array(let values)?:
             let ids = values.compactMap(\.string)
             guard !ids.isEmpty, ids.count == values.count else { throw Failure("invalid_params", "target list must be object ids") }
-            board = try p["board"] == nil ? self.board(forObject: ids[0]) : self.board(p)
+            board = try find(ids[0])
             target = .objects(ids)
         case .object?:
-            board = try self.board(p)
+            board = try find(nil)
             let rect = try p["target"]!.decode(Frame.self)
             guard rect.w > 0, rect.h > 0 else { throw Failure("invalid_params", "target rect must have a positive size") }
             target = .rect(rect)
@@ -1044,12 +1316,14 @@ public final class ApiRouter {
         guard (0.1...4).contains(scale) else { throw Failure("invalid_params", "scale must be between 0.1 and 4") }
         let exclude = try RenderExclusion(p["exclude"]?.array ?? [], objects: board.objects)
         let timeout = min(max(p["timeoutMs"]?.int ?? 8000, 0), 60_000)
-        let request = RenderRequest(target: target, scale: scale, full: p["full"]?.bool ?? false, exclude: exclude,
-                                    padding: max(0, p["padding"]?.number ?? 0), timeout: .milliseconds(timeout))
-        let (format, out) = try imageDestination(p, name: "render")
-        guard let renderView else { throw Failure("unsupported", "rendering needs the app UI") }
-        let output = try await renderView(board, request, format)
-        var result = inline ? Self.inlined(output) : try await deliver(output, to: out)
+        return (board, RenderRequest(target: target, scale: scale, full: p["full"]?.bool ?? false, exclude: exclude,
+                                     padding: max(0, p["padding"]?.number ?? 0), timeout: .milliseconds(timeout)))
+    }
+
+    /// `view.render`'s answer: the image as delivered (`inlined`, or the file written), and where
+    /// the board and its objects landed in it.
+    static func rendered(_ output: RenderOutput, _ image: [String: JSONValue]) -> JSONValue {
+        var result = image
         result["canvasRect"] = RenderMath.json(output.canvasRect)
         result["scale"] = .number(output.scale)
         result["objects"] = .array(output.objects.map(\.json))
@@ -1067,9 +1341,14 @@ public final class ApiRouter {
     /// `view.snapshot`: the window as shown, with the viewport it shows.
     private func snapshot(_ p: JSONValue) async throws -> JSONValue {
         let board = try board(p)
-        let (format, out) = try imageDestination(p, name: "snapshot")
+        let (format, out) = try Self.imageDestination(p, name: "snapshot")
         guard let snapshotBoard else { throw Failure("unsupported", "snapshots need the app UI") }
         guard let shot = await snapshotBoard(board, format) else { throw Failure("unavailable", "board \(board.id) has no window") }
+        return try await Self.snapshotResult(shot, to: out)
+    }
+
+    /// `view.snapshot`'s answer: `shot`'s picture written to `out`, with the viewport it shows.
+    static func snapshotResult(_ shot: (output: RenderOutput, viewport: Viewport), to out: String) async throws -> JSONValue {
         var result = try await deliver(shot.output, to: out)
         result["viewport"] = shot.viewport.json
         result["scale"] = .number(shot.output.scale)
@@ -1108,28 +1387,31 @@ public final class ApiRouter {
 
     /// Format and path from `out` (absolute, in an existing directory; format from its
     /// extension), else a new file `<name>-<ms>-<n>` in `scratchImages` in `format` (default png).
-    private func imageDestination(_ p: JSONValue, name: String) throws -> (ImageFormat, String) {
+    static func imageDestination(_ p: JSONValue, name: String) throws -> (ImageFormat, String) {
         if let out = p["out"]?.string {
             guard out.hasPrefix("/") else { throw Failure("invalid_params", "out must be an absolute path (clients resolve relative paths)") }
             guard let format = ImageFormat(path: out) else { throw Failure("invalid_params", "out must end in .png, .jpg, or .jpeg") }
             return (format, out)
         }
-        var format = ImageFormat.png
-        if let requested = p["format"]?.string {
-            guard let named = ImageFormat(rawValue: requested) else { throw Failure("invalid_params", "format must be png or jpeg") }
-            format = named
-        }
+        let format = try imageFormat(p)
         scratchCount += 1
         let file = "\(name)-\(Int(Date().timeIntervalSince1970 * 1000))-\(scratchCount).\(format == .png ? "png" : "jpg")"
-        return (format, Self.scratchImages.appendingPathComponent(file).path)
+        return (format, scratchImages.appendingPathComponent(file).path)
+    }
+
+    /// `format` (default png): what an image without `out` is encoded as.
+    static func imageFormat(_ p: JSONValue) throws -> ImageFormat {
+        guard let requested = p["format"]?.string else { return .png }
+        guard let format = ImageFormat(rawValue: requested) else { throw Failure("invalid_params", "format must be png or jpeg") }
+        return format
     }
 
     /// Numbers scratch images, so renders in the same millisecond never overwrite each other.
-    private var scratchCount = 0
+    private static var scratchCount = 0
 
-    private func deliver(_ output: RenderOutput, to out: String) async throws -> [String: JSONValue] {
+    private static func deliver(_ output: RenderOutput, to out: String) async throws -> [String: JSONValue] {
         let image = output.image
-        let scratch = Self.scratchImages
+        let scratch = scratchImages
         let failure: String? = await offPool {
             do {
                 let url = URL(fileURLWithPath: out)
@@ -1171,6 +1453,7 @@ public final class ApiRouter {
 
         case "board.get":
             let board = try board(p)
+            let receiptViewer = try p["viewer"].map { try ViewerEdit.viewer($0) }
             var snapshot = board.snapshot.objects
             var regions: [ObjectID]?
             if let branch = p["branch"]?.string {
@@ -1184,8 +1467,17 @@ public final class ApiRouter {
                 "board": .string(board.id), "root": .string(board.root.path),
                 "revision": .number(Double(board.revision)), "objects": .array(objects.map(JSONValue.init)),
             ]
+            if !registry.windowIsOpen(board.id) { result["closed"] = .bool(true) }
+            if let merged = board.repo?.merged, !merged.isEmpty { result["merged"] = .array(merged.map(JSONValue.string)) }
             if let regions { result["regions"] = .array(regions.map(JSONValue.string)) }
             if let since = p["since"]?.int { result["changed"] = .array(board.changed(since: since).map(JSONValue.string)) }
+            let scope = p["branch"]?.string == nil ? nil : Set(snapshot.map(\.id))
+            let markers = board.attentionMarkers(on: scope)
+            if !markers.isEmpty { result["attention"] = .array(markers.map(\.json)) }
+            if let receiptViewer {
+                let receipts = board.composerReceipts.compactMap { $0.viewer == receiptViewer ? $0.json : nil }
+                if !receipts.isEmpty { result["composerReceipts"] = .array(receipts) }
+            }
             return .object(result)
 
         case "board.history":
@@ -1234,7 +1526,7 @@ public final class ApiRouter {
             let boards = stored.map { entry -> JSONValue in
                 var info: [String: JSONValue] = [
                     "board": .string(entry.id), "root": .string(entry.root), "archived": .bool(entry.archived),
-                    "open": .bool(registry.boards[entry.id] != nil), "objects": .number(Double(entry.objectCount)),
+                    "open": .bool(registry.boards[entry.id] != nil && registry.windowIsOpen(entry.id)), "objects": .number(Double(entry.objectCount)),
                 ]
                 if let updatedAt = entry.updatedAt { info["updatedAt"] = .string(updatedAt.formatted(.iso8601)) }
                 if let repo = entry.repo { info["repo"] = .string(repo) }
@@ -1249,6 +1541,9 @@ public final class ApiRouter {
             guard expanded.hasPrefix("/") else { throw Failure("invalid_params", "root must be an absolute path (or start with ~)") }
             let root = URL(fileURLWithPath: expanded).standardizedFileURL
             guard BoardStore.isDirectory(root.path) else { throw Failure("not_found", "no directory at \(root.path)") }
+            if !closingBoards.isEmpty, let existing = registry.boards[BoardStore.boardID(for: root)] {
+                try available(existing)
+            }
             let board = openBoard?(root, p["select"]?.bool ?? false) ?? registry.open(root: root)
             var result: [String: JSONValue] = ["board": .string(board.id), "root": .string(board.root.path), "objects": .number(Double(board.objects.count))]
             if let worktree = GitWorktree.containing(root.path), worktree.commonDir == board.repo?.commonDir {
@@ -1287,6 +1582,7 @@ public final class ApiRouter {
             guard let type = ObjectType(rawValue: try string(p, "type")) else { throw Failure("invalid_params", "unknown object type") }
             guard var props = p["props"], props.object != nil else { throw Failure("invalid_params", "props must be an object") }
             try Self.checkProps(p)
+            let edit = try ViewerEdit(p)
             // Just w and h: that size, placed as a create without a frame is (near the caller).
             let frame = try p["frame"].map { value in
                 if value["x"]?.number == nil, value["y"]?.number == nil, let w = value["w"]?.number, let h = value["h"]?.number {
@@ -1297,29 +1593,42 @@ public final class ApiRouter {
             if type == .note || type == .html, let root = props["root"]?.string, !root.isEmpty { try board.checkLinkRoot(root) }
             try board.checkKey(props, for: nil)
             if type == .diagram, let problem = DiagramSpec.problem(props) { throw Failure("invalid_params", problem) }
+            if type == .browser, let problem = board.browserPropsProblem(props) { throw Failure("invalid_params", problem) }
             if type == .question { props = try board.questionToCreate(props, caller: caller(p)) }
-            let object = board.create(type: type, props: props, frame: frame, parent: p["parent"]?.string, caller: caller(p))
+            let object = try board.asViewerEdit(edit) { board.create(type: type, props: props, frame: frame, parent: p["parent"]?.string, caller: caller(p)) }
             return Self.withWarnings(["object": JSONValue(board.reported(object))], type.unknownPropWarnings(props))
 
         case "object.update":
             let id = try string(p, "id")
             let board = try board(forObject: id)
             try Self.checkProps(p)
+            let edit = try ViewerEdit(p)
+            let z = try p["z"].map { value -> Double in
+                guard let z = value.number, z.isFinite else { throw Failure("invalid_params", "z must be a finite number") }
+                return z
+            }
             var frame = try p["frame"].map { try Self.frame($0, onto: board.object(id).frame) }
             var props = p["props"]
             if let root = props?["root"]?.string, !root.isEmpty, [.note, .html].contains(try board.object(id).type) { try board.checkLinkRoot(root) }
             if let patch = props, try board.object(id).type == .diagram, let problem = DiagramSpec.problem(try board.object(id).props.merging(patch)) {
                 throw Failure("invalid_params", problem)
             }
+            if try board.object(id).type == .browser, let problem = board.browserPropsProblem(props) { throw Failure("invalid_params", problem) }
             (props, frame) = try board.questionUpdate(id, props: props, frame: frame, caller: caller(p))
-            let object = try board.update(id, rev: p["rev"]?.int, frame: frame, props: props, caller: caller(p))
+            let object = try board.asViewerEdit(edit) { try board.update(id, rev: p["rev"]?.int, frame: frame, z: z, props: props, caller: caller(p)) }
             return Self.withWarnings(["object": JSONValue(board.reported(object))], object.type.unknownPropWarnings(p["props"]))
 
         case "object.delete":
             let id = try string(p, "id")
             let board = try board(forObject: id)
-            try board.delete(id, caller: caller(p))
+            let edit = try ViewerEdit(p)
+            try board.asViewerEdit(edit) { try board.delete(id, caller: caller(p)) }
             return .object([:])
+
+        case "board.undo", "board.redo":
+            let board = try board(p)
+            let replay = try board.replayViewer(try ViewerEdit.viewer(p["viewer"]), step: try ViewerEdit.step(p["step"]), redo: method == "board.redo")
+            return replay.json(board)
 
         case "layout.place":
             let id = try string(p, "id")
@@ -1375,6 +1684,7 @@ public final class ApiRouter {
         case "tray.unstage":
             let id = try string(p, "id")
             guard let board = registry.boards.values.first(where: { $0.tray.contains { $0.id == id } }) else { throw BoardError.notFound("mention \(id)") }
+            try available(board)
             try board.unstage(id)
             return .object([:])
 
@@ -1418,6 +1728,25 @@ public final class ApiRouter {
             if !raised.cleared.isEmpty { result["cleared"] = .array(raised.cleared.map(JSONValue.string)) }
             return .object(result)
 
+        case "view.seen":
+            let id = try string(p, "id")
+            let board = try board(forObject: id)
+            if p["rev"] != nil, p["rev"] != .null, p["rev"]?.int == nil || (p["rev"]?.int ?? 0) < 1 {
+                throw Failure("invalid_params", "rev must be an integer of at least 1")
+            }
+            let marker = try p["marker"].map { value -> SeenMarker in
+                guard value != .null else { throw Failure("invalid_params", "marker must be an attention marker") }
+                guard let marker = SeenMarker(value) else { throw Failure("invalid_params", "marker needs id and raisedAt") }
+                guard marker.id == id else { throw Failure("invalid_params", "marker.id must be the object being acknowledged") }
+                return marker
+            }
+            let matchesRevision = p["rev"]?.int.map { board.objects[id]?.rev == $0 } ?? false
+            let acknowledged = board.seen(id, rev: p["rev"]?.int, marker: marker)
+            var result: [String: JSONValue] = ["cleared": .bool(acknowledged.cleared), "seen": .bool(acknowledged.seen)]
+            if matchesRevision, acknowledged.seen, let terminal = board.objects[id], terminal.type == .terminal {
+                result["object"] = try JSONValue.encode(board.reported(terminal))
+            }
+            return .object(result)
         case "view.open_url":
             let board = try board(p)
             let raw = try string(p, "url")
@@ -1432,15 +1761,13 @@ public final class ApiRouter {
             let board = try board(p)
             guard let viewState else { throw Failure("unsupported", "the viewport needs the app UI") }
             guard let state = viewState(board) else { throw Failure("unavailable", "board \(board.id) has no window") }
-            var result: [String: JSONValue] = [
-                "board": .string(board.id), "viewport": state.viewport.json,
-                "selection": .array(state.selection.map(JSONValue.string)), "visible": .bool(state.visible),
-                "appearance": .string(state.appearance),
-            ]
-            if let target = state.promptTarget { result["promptTarget"] = .string(target) }
-            if let focused = state.focused { result["focused"] = .string(focused) }
-            if let group = state.enteredGroup { result["enteredGroup"] = .string(group) }
-            return .object(result)
+            return Self.viewResult(state, board: board.id)
+
+        case "client.list":
+            throw Failure("unsupported", "client.list lists clients attached to easld")
+
+        case "browser.call", "browser.report":
+            throw Failure("unsupported", "\(method) is easld's: the app's own agents use its cmux socket")
 
         case "session.spawn", "session.list", "session.kill", "relay.open":
             // A hosted terminal's session runs under the host's easld, which relays its way back
@@ -1450,6 +1777,19 @@ public final class ApiRouter {
         default:
             throw Failure("invalid_params", "unknown method \(method)")
         }
+    }
+
+    /// `view.get`'s answer for the window showing `board`.
+    static func viewResult(_ state: ViewState, board: BoardID) -> JSONValue {
+        var result: [String: JSONValue] = [
+            "board": .string(board), "viewport": state.viewport.json,
+            "selection": .array(state.selection.map(JSONValue.string)), "visible": .bool(state.visible),
+            "appearance": .string(state.appearance),
+        ]
+        if let target = state.promptTarget { result["promptTarget"] = .string(target) }
+        if let focused = state.focused { result["focused"] = .string(focused) }
+        if let group = state.enteredGroup { result["enteredGroup"] = .string(group) }
+        return .object(result)
     }
 
     // MARK: Layout
@@ -1531,7 +1871,8 @@ public final class ApiRouter {
     /// adds `lastCommand`, the last command its shell finished (not a prop: it changes no `rev`);
     /// a browser tile's adds `page`, what its page reported since it loaded (`PageLog`), after
     /// the `since` cursor when given; a note's adds `fences`, how each anchored fence resolves
-    /// now; a code tile showing a range it anchors adds `rangeStatus`, the same for its range.
+    /// now (one whose file lies outside the board's areas, `BoardAreas`, refused whatever its
+    /// tile shows); a code tile showing a range it anchors adds `rangeStatus`, the same for its range.
     private func get(_ p: JSONValue) async throws -> JSONValue {
         let result = try dispatch("object.get", p)
         guard let id = p["id"]?.string, let board = registry.board(containing: id), let object = board.objects[id] else { return result }
@@ -1548,10 +1889,10 @@ public final class ApiRouter {
         }
         if object.type == .note {
             let fences = NoteMarkdown.anchoredFences(in: NoteMarkdown.parse(object.props["markdown"]?.string ?? ""))
-            let excerpts = await noteExcerpts?(board, id) ?? [:]
-            let unresolved = fences.filter { excerpts[$0.key] == nil }
+            let tile = await noteExcerpts?(board, id) ?? [:]
             let reading = await board.linkSource(of: object)
-            let resolved = excerpts.merging(await NoteSource.excerpts(for: reading.fences(unresolved), root: reading.root)) { tile, _ in tile }
+            var resolved = await NoteSource.excerpts(for: reading.fences(fences), root: reading.root, within: BoardAreas(boardRoot: board.root))
+            for (key, excerpt) in tile where resolved[key]?.refused == false { resolved[key] = excerpt }
             return result.merging(.object(["fences": NoteMarkdown.status(of: fences, excerpts: resolved)]))
         }
         if object.type == .code, let fence = CodeAnchor.fence(object.props) {
@@ -1665,6 +2006,7 @@ public final class ApiRouter {
         if !given.isEmpty { update["props"] = .object(given) }
         if let frame = p["frame"] { update["frame"] = frame }
         if let size = p["size"] { update["size"] = size }
+        for key in ["viewer", "step"] { update[key] = p[key] }
         return .object(update)
     }
 
@@ -1769,7 +2111,7 @@ public final class ApiRouter {
         }
         // A note anchored to a branch anchors its ranges on the text at the ref.
         let reading = RefSource.ref(of: merged) == nil ? LinkReading(root: root) : await board.linkSource(props: merged)
-        let text = await NoteMarkdown.anchoringRanges(markdown, reading: reading)
+        let text = await NoteMarkdown.anchoringRanges(markdown, reading: reading, within: BoardAreas(boardRoot: board.root))
         guard text != markdown else { return p }
         props["markdown"] = .string(text)
         params["props"] = .object(props)
@@ -1955,7 +2297,10 @@ public final class ApiRouter {
             let params: JSONValue
             do {
                 try Self.checkParams(method, op["params"] ?? .object([:]))
-                var raw = prepared(method, try Self.replacingReferences(op["params"] ?? .object([:])) { n, _ in updating[n].map(JSONValue.string) })
+                if op["params"]?["viewer"] != nil || op["params"]?["step"] != nil {
+                    throw Failure("invalid_params", "viewer and step mark a remote window's own edit: they aren't taken inside object.batch")
+                }
+                var raw = prepared(method, Self.replacingReferences(op["params"] ?? .object([:])) { n, _ in updating[n].map(JSONValue.string) })
                 if method == "object.upsert" {
                     let key = try string(raw, "key")
                     (method, raw) = try upserted(raw, plan: plan)
@@ -2278,20 +2623,27 @@ public final class ApiRouter {
         return value
     }
 
+    @discardableResult
+    private func available(_ board: Board) throws -> Board {
+        guard !board.isClosed else { throw Failure("not_found", "board \(board.id) was closed while the request was pending") }
+        guard !closingBoards.contains(board.id) else { throw Failure("conflict", "board \(board.id) is closing") }
+        return board
+    }
+
     /// Target board: explicit `board`, else the caller tile's board, else the frontmost board.
     func board(_ p: JSONValue) throws -> Board {
         if let id = p["board"]?.string {
             guard let board = registry.board(id: id) else { throw BoardError.notFound("board \(id)") }
-            return board
+            return try available(board)
         }
-        if let caller = p["caller"]?.string, let board = registry.board(containing: caller) { return board }
-        if let id = registry.frontmost, let board = registry.boards[id] { return board }
+        if let caller = p["caller"]?.string, let board = registry.board(containing: caller) { return try available(board) }
+        if let id = registry.frontmost, let board = registry.boards[id] { return try available(board) }
         throw Failure("not_found", "no open board")
     }
 
     func board(forObject id: ObjectID) throws -> Board {
         guard let board = registry.board(containing: id) else { throw BoardError.notFound("object \(id)") }
-        return board
+        return try available(board)
     }
 
     /// A caller is only honored when it is a terminal tile, on any open board: an agent working

@@ -4,24 +4,33 @@
 /// `ApiRouter` checks every request against, and names in its `invalid_params` errors.
 enum ApiParams {
     /// The schema's `version` and the hash of the file this was generated from (`client.attach`).
-    static let schemaVersion = 1
-    static let schemaHash = "45453de05d8d0532"
+    static let schemaVersion = 2
+    static let schemaHash = "608eca66886347ba"
 
     static let methods: [String: (accepted: [String], required: [String])] = [
+        "surface.stream": (["id", "scale", "format"], ["id"]),
+        "surface.ack": (["stream", "frame"], ["stream", "frame"]),
+        "surface.input": (["stream", "events"], ["stream", "events"]),
+        "surface.answer": (["stream", "dialog", "accept", "text", "user", "password", "choice"], ["stream", "dialog", "accept"]),
+        "surface.stop": (["stream"], ["stream"]),
         "system.ping": ([], []),
         "app.metrics": (["reset", "watch"], []),
-        "board.get": (["board", "since", "branch"], []),
+        "app.update": (["mode"], ["mode"]),
+        "board.get": (["board", "viewer", "since", "branch"], []),
+        "board.undo": (["board", "viewer", "step"], ["viewer", "step"]),
+        "board.redo": (["board", "viewer", "step"], ["viewer", "step"]),
         "board.history": (["board", "since", "limit", "kinds"], []),
         "board.list": ([], []),
         "board.open": (["root", "select"], ["root"]),
         "board.open_remote": (["host", "board", "select"], ["host", "board"]),
+        "board.close": (["board", "endSessions"], []),
         "board.export": (["board", "path"], []),
         "object.get": (["id", "as", "since"], ["id"]),
         "object.find": (["board", "key", "keyPrefix", "type", "status", "as"], []),
-        "object.create": (["board", "type", "props", "frame", "size", "parent", "caller"], ["type", "props"]),
-        "object.update": (["id", "rev", "frame", "size", "props", "caller"], ["id"]),
+        "object.create": (["board", "type", "props", "frame", "size", "parent", "viewer", "step", "caller"], ["type", "props"]),
+        "object.update": (["id", "rev", "frame", "z", "size", "props", "viewer", "step", "caller"], ["id"]),
         "object.upsert": (["board", "key", "type", "props", "frame", "size", "caller"], ["key", "type", "props"]),
-        "object.delete": (["id", "caller"], ["id"]),
+        "object.delete": (["id", "viewer", "step", "caller"], ["id"]),
         "object.measure": (["board", "type", "props", "width", "caller"], ["type", "props"]),
         "object.reload": (["id", "timeoutMs", "caller"], ["id"]),
         "object.batch": (["board", "ops", "caller"], ["ops"]),
@@ -39,12 +48,13 @@ enum ApiParams {
         "agent.report_session": (["tile", "kind", "sessionId", "sessionPath", "model", "thinking"], ["tile", "kind"]),
         "agent.release": (["tile", "kind", "source"], ["tile", "kind"]),
         "agent.list": ([], []),
-        "agent.prompt": (["target", "text", "mentions", "caller", "from", "when", "message", "force", "composer", "answer"], ["target", "text"]),
+        "agent.prompt": (["target", "text", "mentions", "staged", "viewer", "caller", "from", "when", "message", "force", "composer", "answer"], ["target", "text"]),
         "agent.wait": (["target", "caller", "until", "timeoutMs"], ["target"]),
         "agent.read": (["target", "caller", "lines", "since", "block", "final"], ["target"]),
         "agent.inbox": (["tile", "ack", "started", "waitMs"], ["tile"]),
         "agent.restart": (["target", "caller", "mode", "args", "force"], ["target", "mode"]),
         "follow.report": (["tile", "path", "range", "changes", "action"], ["tile", "path", "action"]),
+        "view.seen": (["id", "rev", "marker"], ["id"]),
         "view.attention": (["id", "message", "clear", "caller"], ["id"]),
         "view.get": (["board"], []),
         "view.open_url": (["url", "board", "caller"], ["url"]),
@@ -55,7 +65,10 @@ enum ApiParams {
         "session.kill": (["tile", "home"], ["tile"]),
         "relay.open": (["instance", "port", "token"], ["instance", "port", "token"]),
         "events.subscribe": (["board", "events"], []),
-        "client.attach": (["version", "schema", "app", "host", "serves", "boards", "focused"], ["version", "schema", "serves"]),
+        "client.attach": (["version", "schema", "app", "host", "identity", "serves", "boards", "focused"], ["version", "schema", "serves"]),
+        "client.list": ([], []),
+        "browser.call": (["id", "method", "params", "caller"], ["id", "method", "params"]),
+        "browser.report": (["id", "url", "pageTitle", "caller", "actor"], ["id"]),
         "text.measure": (["items", "board"], ["items"]),
     ]
 }

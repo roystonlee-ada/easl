@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -49,16 +50,25 @@ func (r *Router) attach(p map[string]any, c Conn) (any, error) {
 			a.Boards = append(a.Boards, b.ID())
 		}
 	}
+	if v, present := p["identity"]; present && v != nil {
+		id, ok := v.(string)
+		if !ok || !idPattern.MatchString(id) {
+			return nil, invalid("identity must be an id")
+		}
+		a.Identity = id
+	}
 	if focused, ok := optStr(p, "focused"); ok {
 		a.Focused = focused
 		if b, ok := r.reg.Board(focused); ok {
 			a.Focused = b.ID()
 		}
 	}
-	client, err := r.clients.Attach(c, a)
+	client, boards, err := r.clients.Attach(c, a)
 	if err != nil {
 		return nil, err
 	}
+	r.announceClients(boards)
+	r.fillMissingOwners(a.Boards)
 	return map[string]any{"client": client.ID, "version": float64(api.SchemaVersion), "schema": api.SchemaHash}, nil
 }
 
@@ -145,6 +155,31 @@ func noClient(board, need string) error {
 	return fail(api.CodeUnavailable, "no app shows board %s: %s", board, need)
 }
 
+// clientList is client.list: every attached client, including a background viewer.
+// Absent app, host, and focused are omitted. Focused is the board the client focused
+// last; a later attach that doesn't name one leaves it (clients.Registry.Attach).
+func (r *Router) clientList() any {
+	listed := r.clients.List()
+	out := make([]any, len(listed))
+	for i, c := range listed {
+		entry := map[string]any{"id": c.ID, "boards": c.Boards, "serves": c.Serves}
+		if c.Identity != "" {
+			entry["identity"] = c.Identity
+		}
+		if c.App != "" {
+			entry["app"] = c.App
+		}
+		if c.Host != "" {
+			entry["host"] = c.Host
+		}
+		if c.Focused != "" {
+			entry["focused"] = c.Focused
+		}
+		out[i] = entry
+	}
+	return map[string]any{"clients": out}
+}
+
 // client is the client a delegated method on board goes to (clients.Registry.Choose).
 func (r *Router) client(method, board, need string) (*clients.Client, error) {
 	if c := r.clients.Choose(method, board); c != nil {
@@ -156,9 +191,9 @@ func (r *Router) client(method, board, need string) (*clients.Client, error) {
 // await forwards a checked call to c and waits for its answer with the registry's lock released,
 // so the boards stay usable (by c too) while c works. Whatever the caller read of the boards
 // before may have changed when it returns.
-func (r *Router) await(c *clients.Client, method string, params map[string]any, deadline time.Duration) (map[string]any, error) {
+func (r *Router) await(c *clients.Client, board, method string, params map[string]any, deadline time.Duration) (map[string]any, error) {
 	r.reg.Mu.Unlock()
-	result, failure := r.clients.Call(c, method, params, deadline)
+	result, failure := r.clients.Call(context.Background(), c, board, method, params, deadline)
 	r.reg.Mu.Lock()
 	if failure != nil {
 		return nil, failure
@@ -176,7 +211,7 @@ func (r *Router) forward(method, board string, params map[string]any, deadline t
 	if err != nil {
 		return nil, err
 	}
-	result, err := r.await(c, method, params, deadline)
+	result, err := r.await(c, board, method, params, deadline)
 	if err != nil {
 		return nil, err
 	}

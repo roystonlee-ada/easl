@@ -1,13 +1,6 @@
 import AppKit
 import CanvasCore
 
-/// The changes tile (`type: changes`): every file that differs from the tile's base (default
-/// HEAD: the uncommitted work) under its paths, in the board's worktree or another worktree of
-/// its repository (`props.root`), each with its hunks as a highlighted unified diff, Stage and
-/// Discard per file, hunk, or selected lines (each one ⌘Z step, `Board.recordReview`), a file
-/// list and filter to find files, and Viewed checks that fold files until their diff changes.
-/// Live while files change. Drawn straight from the model like code tiles (`ChangesPainter`);
-/// git runs off the main thread and only while the tile is live.
 @MainActor
 final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolTipOwner {
     private(set) var object: CanvasObject
@@ -62,6 +55,7 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     private weak var basePopover: NSPopover?
 
     private var isLive = true
+    private var hostBoardClosed = false
     private var needsLoad = true
     private var loadTask: Task<Void, Never>?
     private var generation = 0
@@ -75,17 +69,31 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     private var heldRepository: String?
     /// A Stage or Discard is being applied; others wait for it (they'd be built from old rows).
     private var acting = false
+    private var actionTask: Task<Void, Never>?
+    private var closureGeneration = 0
     /// The listing after an action: its current hunk scrolls into view.
     private var revealAfterLoad = false
 
-    static let tooltip = """
-    Click a line to open it in a code tile; drag over lines, ⇧-click or ⌘-click to select lines (an edited line brings its old version), then Stage, Unstage, or Discard just those; \
-    Hyper-click (⌃⌥⇧⌘) a line or hunk header to mention it; click a file's header to fold it, its Viewed box to fold it until it changes; click the summary to pick the base.
-    Keys once the tile has the keyboard (↩ or a click): j or ↓ next hunk, k or ↑ previous hunk, J or ] next file, K or [ previous file, \
-    / filter files, Return open the hunk in a code tile, s stage, u unstage, r then ⌘⌫ discard, m mention (the selected lines, else the hunk), Esc back to the board.
-    Discard asks first: click it again, or press ⌘⌫ after r, to throw the change away; any other key keeps it. Every Stage, Unstage, and Discard is one ⌘Z. \
-    Discard only puts back work not committed yet: committed hunks have none.
-    """
+    private let git: HostGit?
+    private var hostWatch: HostFileWatch?
+    private var hostRetry: Task<Void, Never>?
+    private var hostListing: HostChangesLoad?
+    private var hostRefShas: [String: String] = [:]
+
+    static let tooltip = reviewTooltip(undo: "Every Stage, Unstage, and Discard is one ⌘Z.")
+
+    static let remoteTooltip = reviewTooltip(undo: "Stage, Unstage, and Discard act on the host's repository; ⌘Z doesn't undo them from here.")
+
+    private static func reviewTooltip(undo: String) -> String {
+        """
+        Click a line to open it in a code tile; drag over lines, ⇧-click or ⌘-click to select lines (an edited line brings its old version), then Stage, Unstage, or Discard just those; \
+        Hyper-click (⌃⌥⇧⌘) a line or hunk header to mention it; click a file's header to fold it, its Viewed box to fold it until it changes; click the summary to pick the base.
+        Keys once the tile has the keyboard (↩ or a click): j or ↓ next hunk, k or ↑ previous hunk, J or ] next file, K or [ previous file, \
+        / filter files, Return open the hunk in a code tile, s stage, u unstage, r then ⌘⌫ discard, m mention (the selected lines, else the hunk), Esc back to the board.
+        Discard asks first: click it again, or press ⌘⌫ after r, to throw the change away; any other key keeps it. \(undo) \
+        Discard only puts back work not committed yet: committed hunks have none.
+        """
+    }
 
     /// The tooltip of a tile comparing two commits: reading keys only.
     static let readingTooltip = """
@@ -96,21 +104,25 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     / filter files, Return open the hunk in a code tile, m mention (the selected lines, else the hunk), Esc back to the board.
     """
 
-    init(object: CanvasObject, board: Board) {
+    init(object: CanvasObject, board: Board, git: HostGit? = nil) {
         self.object = object
         self.board = board
+        self.git = git
         super.init(frame: NSRect(origin: .zero, size: RenderMath.body(of: object)))
         wantsLayer = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
         let center = NotificationCenter.default
-        center.addObserver(self, selector: #selector(repositoryChanged(_:)), name: .gitDiffBaseChanged, object: nil)
-        center.addObserver(self, selector: #selector(repositoryChanged(_:)), name: .reviewPatchApplied, object: nil)
+        if git == nil {
+            center.addObserver(self, selector: #selector(repositoryChanged(_:)), name: .gitDiffBaseChanged, object: nil)
+            center.addObserver(self, selector: #selector(repositoryChanged(_:)), name: .reviewPatchApplied, object: nil)
+        }
         center.addObserver(self, selector: #selector(patchFailed(_:)), name: .reviewPatchFailed, object: object.id)
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
 
     deinit {
+        actionTask?.cancel()
         if let heldRepository { Task { await GitDiffEngine.shared.release(heldRepository) } }
     }
 
@@ -134,6 +146,18 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if git != nil, window == nil {
+            generation += 1
+            loadTask?.cancel()
+            loadTask = nil
+            hostWatch?.cancel()
+            hostWatch = nil
+            hostRetry?.cancel()
+            hostRetry = nil
+            reloadWork?.cancel()
+            reloadWork = nil
+            needsLoad = true
+        }
         if window != nil, isLive, needsLoad { load() }
         installFilterField()
         refreshToolTips()
@@ -204,11 +228,12 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     /// Lists and diffs the changes (git and parsing off the main thread) and installs them.
     /// Deferred until the tile is live.
     private func load() {
-        guard isLive else {
+        guard isLive, git == nil || window != nil else {
             needsLoad = true
             return
         }
         needsLoad = false
+        if let git { return loadFromHost(git) }
         generation += 1
         loadedThrough = FSEventsGetCurrentEventId()
         let current = generation, root = board.root, spec = spec
@@ -232,6 +257,71 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
             if spec.root == nil, spec.head == nil, spec.ref == nil { self.onBranch?(set.branch) }
             if let ref = spec.ref, let sha = set.refSha { self.board.recordRefSha(self.object.id, ref: ref, sha: sha) }
         }
+    }
+
+    private func loadFromHost(_ git: HostGit) {
+        generation += 1
+        loadTask?.cancel()
+        hostRetry?.cancel()
+        hostRetry = nil
+        let current = generation, boardRoot = board.root.path, spec = spec
+        let read = hostSpec(spec)
+        loadTask = Task { [weak self] in
+            let result: Result<HostChangesLoad, Error>
+            do {
+                result = .success(try await git.changes(boardRoot: boardRoot, spec: read))
+            } catch is CancellationError {
+                return
+            } catch {
+                result = .failure(error)
+            }
+            await MainTurns.next()
+            guard let self, current == self.generation, self.isLive else { return }
+            self.loadTask = nil
+            switch result {
+            case .success(let load): self.installHost(load, spec: spec, git: git)
+            case .failure(let error): self.hostLoadFailed(Self.hostReason(error))
+            }
+        }
+    }
+
+    private func hostSpec(_ spec: ChangesSpec) -> ChangesSpec {
+        var read = spec
+        if let ref = spec.ref, let sha = hostRefShas[ref] { read.refSha = sha }
+        return read
+    }
+
+    private func installHost(_ load: HostChangesLoad, spec: ChangesSpec, git: HostGit) {
+        hostListing = load
+        if let ref = spec.ref, let sha = load.set.refSha { hostRefShas[ref] = sha }
+        let previous = set
+        install(load.set)
+        growIfFitted(from: previous, to: load.set)
+        if spec.root == nil, spec.head == nil, spec.ref == nil { onBranch?(load.set.branch) }
+        hostWatch?.cancel()
+        hostWatch = load.probe.map { probe in
+            HostFileWatch(baseline: load.baseline, probe: { await git.stamp(probe) }) { [weak self] _ in self?.scheduleReload(after: 0.05) }
+        }
+    }
+
+    private func hostLoadFailed(_ reason: String) {
+        let text = "host unavailable: \(reason)"
+        if set != nil {
+            show(message: text)
+        } else {
+            install(ChangeSet(notice: text))
+        }
+        let current = generation
+        hostRetry = Task { [weak self] in
+            guard (try? await Task.sleep(for: .seconds(2))) != nil, let self, current == self.generation, self.isLive, self.window != nil else { return }
+            self.hostRetry = nil
+            self.load()
+        }
+    }
+
+    private static func hostReason(_ error: Error) -> String {
+        if case .unavailable(let why)? = error as? HostFileError { return why }
+        return "\(error)"
     }
 
     /// A new listing: the current hunk stays the same file and position (the next one when it
@@ -299,11 +389,12 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     /// A painter for `set` as the tile shows it: its folds, filter, list, Viewed checks, current
     /// hunk, selection, header message, and a Discard asking to be pressed again.
     private func makePainter(for set: ChangeSet, width: CGFloat, laidOut: (rows: ChangeRows, names: [String])? = nil) -> ChangesPainter {
-        var painter = ChangesPainter(set: set, collapsed: collapsed, width: width, filter: filter, listOpen: listOpen, laidOut: laidOut)
+        var painter = ChangesPainter(set: set, canPickBase: git != nil || set.repository != nil, collapsed: collapsed, width: width, filter: filter, listOpen: listOpen, laidOut: laidOut)
         painter.viewed = object.props["viewed"]
         painter.current = current
         painter.selection = selection
         painter.message = message
+        painter.undoable = git == nil
         if let asked = discard.target, let hint = discard.hint, let file = set.files.firstIndex(where: { $0.boardPath == asked.path }) {
             let hunk = asked.hunk.flatMap { id in set.files[file].hunks.firstIndex { $0.id == id } }
             if asked.hunk == nil || hunk != nil { painter.discardAsked = (file, hunk, hint) }
@@ -895,6 +986,7 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     /// the commit of `side` (the base's merge-base for the old side, the head for the new), at
     /// the file's name there.
     private func openCode(file: Int, line: Int, side: DiffSide) {
+        guard !hostBoardClosed, !board.isClosed else { return }
         guard let set else { return }
         let changed = set.files[file]
         let pin = set.comparesCommits ? (side == .old ? set.base : set.head) : nil
@@ -915,6 +1007,7 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     /// Marks a file Viewed for its current diff (folding it) or unmarks it (unfolding it):
     /// `props.viewed`, one ⌘Z step; entries for diffs that changed since are dropped with it.
     private func toggleViewed(_ file: Int) {
+        guard !hostBoardClosed, !board.isClosed else { return }
         guard let set else { return }
         let changed = set.files[file]
         let current = object.props["viewed"]
@@ -942,20 +1035,31 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
         setScroll(painter.rows.tops[row])
     }
 
+    private func acceptsAction(_ epoch: Int) -> Bool {
+        !Task.isCancelled && !hostBoardClosed && !board.isClosed && closureGeneration == epoch
+    }
+
     /// Stage, unstage, or discard one hunk (nil: the whole file), or some of its lines: the patch
     /// is built, applied, and recorded as one undo step; a refusal shows in the header and
     /// changes nothing. Discard only ever puts back work not committed yet: a committed hunk is
     /// refused, and against a base older than HEAD (`ChangeSet.includesCommits`) the patch is
     /// built from HEAD, so a hunk mixing committed and uncommitted lines loses only the latter.
     private func perform(_ action: ChangesAction, file: Int, hunk: Int?, lines: Set<Int>?) {
+        guard !hostBoardClosed, !board.isClosed else { return }
+        if let git { return performOnHost(git, action, file: file, hunk: hunk, lines: lines) }
         guard !acting, let set, let repository = set.repository, set.files.indices.contains(file) else { return }
         let changed = set.files[file]
         let target = hunk.map { changed.hunks[$0] }
         guard action.applies(to: changed, hunk: hunk) else { return show(message: action.refusal) }
         acting = true
+        let epoch = closureGeneration
         let tile = object.id, board = board, includesCommits = set.includesCommits
-        Task { [weak self] in
-            defer { self?.acting = false }
+        actionTask = Task { [weak self] in
+            defer {
+                self?.acting = false
+                self?.actionTask = nil
+            }
+            guard self?.acceptsAction(epoch) == true else { return }
             do {
                 let hunks = target.map { [$0] }
                 let patch: ReviewPatch
@@ -966,7 +1070,9 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
                     patch = includesCommits ? try await ReviewPatch.discardUncommitted(hunks, of: changed, in: repository, lines: lines)
                         : try ReviewPatch.revert(hunks ?? changed.hunks, of: changed, in: repository, lines: lines)
                 }
+                guard self?.acceptsAction(epoch) == true else { return }
                 try await ReviewGit.shared.apply(patch)
+                guard self?.acceptsAction(epoch) == true else { return }
                 let entry = ReviewPatch.entry(action.entryName, file: changed, hunk: target, lines: lines, patch: patch)
                 try board.recordReview(tile: tile, entry: entry, patch: patch)
                 // Files changing shows nowhere on the board: say what went and how to get it back.
@@ -979,8 +1085,59 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
                     self.refreshPainter()
                 }
             } catch let failure as ChangesFailure {
+                guard self?.acceptsAction(epoch) == true else { return }
                 self?.show(message: "\(action.rawValue) refused: \(failure.message)")
             } catch {
+                guard self?.acceptsAction(epoch) == true else { return }
+                self?.show(message: "\(action.rawValue) failed: \(error)")
+            }
+        }
+    }
+
+    private func performOnHost(_ git: HostGit, _ action: ChangesAction, file: Int, hunk: Int?, lines: Set<Int>?) {
+        guard !acting, let set, let listing = hostListing, let checkout = listing.checkout, set.files.indices.contains(file) else { return }
+        let changed = set.files[file]
+        let target = hunk.map { changed.hunks[$0] }
+        guard action.applies(to: changed, hunk: hunk) else { return show(message: action.refusal) }
+        guard let sides = listing.sides[changed.path] else { return show(message: "\(action.rawValue) refused: too large to show") }
+        acting = true
+        let epoch = closureGeneration
+        let tile = object.id, board = board, includesCommits = set.includesCommits, boardRoot = board.root.path
+        actionTask = Task { [weak self] in
+            defer {
+                self?.acting = false
+                self?.actionTask = nil
+            }
+            guard self?.acceptsAction(epoch) == true else { return }
+            do {
+                let hunks = target.map { [$0] }
+                let patch: ReviewPatch
+                switch action {
+                case .stage: patch = try await ReviewPatch.stage(hunks, of: changed, sides: sides, onHost: checkout, lines: lines)
+                case .unstage: patch = try await ReviewPatch.unstage(hunks, of: changed, sides: sides, onHost: checkout, lines: lines)
+                case .revert:
+                    patch = includesCommits ? try await ReviewPatch.discardUncommitted(hunks, of: changed, sides: sides, onHost: checkout, lines: lines)
+                        : try ReviewPatch.revert(hunks ?? changed.hunks, of: changed, onHost: checkout, lines: lines)
+                }
+                guard self?.acceptsAction(epoch) == true else { return }
+                try await git.apply(patch, to: changed, sides: sides, boardRoot: boardRoot)
+                guard self?.acceptsAction(epoch) == true else { return }
+                let entry = ReviewPatch.entry(action.entryName, file: changed, hunk: target, lines: lines, patch: patch)
+                try board.recordReview(tile: tile, entry: entry, patch: patch)
+                if action == .revert { (self?.enclosingScrollView as? CanvasView)?.showNotice(ReviewPatch.discardNotice(of: entry, host: git.hostName)) }
+                guard let self else { return }
+                self.revealAfterLoad = true
+                if lines != nil {
+                    self.selection = nil
+                    self.anchor = nil
+                    self.refreshPainter()
+                }
+                self.load()
+            } catch let failure as ChangesFailure {
+                guard self?.acceptsAction(epoch) == true else { return }
+                self?.show(message: "\(action.rawValue) refused: \(failure.message)")
+            } catch {
+                guard self?.acceptsAction(epoch) == true else { return }
                 self?.show(message: "\(action.rawValue) failed: \(error)")
             }
         }
@@ -988,14 +1145,28 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
 
     // MARK: TileContent
 
+    func setHostBoardClosed(_ closed: Bool) {
+        guard hostBoardClosed != closed else { return }
+        hostBoardClosed = closed
+        closureGeneration += 1
+        if closed {
+            actionTask?.cancel()
+            setLive(false)
+            dropDiscardQuestion()
+            needsDisplay = true
+        }
+    }
+
     func setLive(_ live: Bool) {
+        let live = live && !hostBoardClosed
         guard live != isLive else { return }
         isLive = live
         if live {
             installFilterField()
             refreshToolTips()
-            if needsLoad || events == nil { load() }
+            if needsLoad || (git == nil ? events == nil : hostWatch == nil) { load() }
         } else {
+            basePopover?.close()
             loadTask?.cancel()
             loadTask = nil
             reloadWork?.cancel()
@@ -1004,6 +1175,10 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
             events = nil
             if let heldRepository { Task { await GitDiffEngine.shared.release(heldRepository) } }
             heldRepository = nil
+            hostWatch?.cancel()
+            hostWatch = nil
+            hostRetry?.cancel()
+            hostRetry = nil
             needsLoad = true
             cache.removeAll()
             removeFilterField()
@@ -1090,19 +1265,38 @@ final class ChangesTile: NSView, TileContent, NSSearchFieldDelegate, NSViewToolT
     /// directory, and nothing is pending. Off screen or zoomed out nothing is watched (and a
     /// props change waits for the tile to be live), so a render lists afresh.
     private var listingIsCurrent: Bool {
-        isLive && !needsLoad && loadTask == nil && reloadWork == nil && events != nil && set != nil
+        isLive && !needsLoad && loadTask == nil && reloadWork == nil && (git == nil ? events != nil : hostWatch != nil) && set != nil
     }
 
     func render(_ request: TileRenderRequest) async -> TileRender {
+        guard !Task.isCancelled else { return .placeholder(request, "cancelled") }
+        let generation = closureGeneration
         var loaded = set
-        if !listingIsCurrent {
+        if !hostBoardClosed, !board.isClosed, !listingIsCurrent {
             let spec = spec
-            let fresh = await ChangeSet.load(root: board.root, spec: spec)
+            let fresh: ChangeSet
+            var hostLoad: HostChangesLoad?
+            if let git {
+                do {
+                    let load = try await git.changes(boardRoot: board.root.path, spec: hostSpec(spec))
+                    hostLoad = load
+                    fresh = load.set
+                } catch {
+                    return .placeholder(request, Task.isCancelled || error is CancellationError ? "cancelled" : "host unavailable: \(Self.hostReason(error))")
+                }
+            } else {
+                fresh = await ChangeSet.load(root: board.root, spec: spec)
+            }
             guard !Task.isCancelled else { return .placeholder(request, "cancelled") }
+            guard generation == closureGeneration, !hostBoardClosed, !board.isClosed else {
+                return .placeholder(request, "board availability changed while rendering")
+            }
             guard spec == self.spec else { return .placeholder(request, "the tile changed while loading") }
+            if let ref = spec.ref, let sha = hostLoad?.set.refSha { hostRefShas[ref] = sha }
             // A live tile's own load installs (and grows a fitted frame); one that isn't live
             // keeps this listing for its card and revalidates the next time it is.
             if !isLive || set == nil {
+                if let hostLoad { hostListing = hostLoad }
                 install(fresh)
                 if !isLive { needsLoad = true }
             }
@@ -1131,8 +1325,13 @@ extension ChangesTile {
     /// typed into a small field. A pick is `props.base`, one ⌘Z step.
     fileprivate func baseMenu(below rect: NSRect) -> NSMenu {
         let current = ChangesBaseChoice(prop: spec.baseProp)
-        let directory = spec.directory(boardRoot: board.root)
-        let defaultBranch = GitWorktree.containing(directory.path)?.defaultBranch
+        let defaultBranch: String?
+        if git != nil {
+            defaultBranch = hostListing?.defaultBranch
+        } else {
+            let directory = spec.directory(boardRoot: board.root)
+            defaultBranch = GitWorktree.containing(directory.path)?.defaultBranch
+        }
         let menu = NSMenu()
         // Two commits compared have no uncommitted work to pick.
         for choice in ChangesBaseChoice.choices(current: current) where !(choice == .uncommitted && (spec.head != nil || set?.comparesCommits == true)) {
@@ -1146,7 +1345,7 @@ extension ChangesTile {
     }
 
     fileprivate func setBase(_ choice: ChangesBaseChoice) {
-        guard choice.prop != spec.baseProp else { return }
+        guard !hostBoardClosed, !board.isClosed, choice.prop != spec.baseProp else { return }
         _ = try? board.update(object.id, props: .object(["base": .string(choice.prop)]))
     }
 
@@ -1154,6 +1353,7 @@ extension ChangesTile {
     /// Return compares with it, Esc or a click elsewhere leaves the base as it is. A name git
     /// doesn't know shows as the tile's notice, and the picker is still there to fix it.
     fileprivate func askForBase(below rect: NSRect) {
+        guard !hostBoardClosed, !board.isClosed else { return }
         let field = NSTextField(string: "")
         field.placeholderString = "commit, branch, or tag (HEAD~3, origin/main, v1.2)"
         field.font = .systemFont(ofSize: 12)

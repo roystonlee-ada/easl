@@ -35,7 +35,9 @@ func (f *fixture) openBoard(name string) (string, string) {
 func (f *fixture) closeBoard(id string) {
 	f.router.reg.Mu.Lock()
 	defer f.router.reg.Mu.Unlock()
-	f.router.reg.Close(id)
+	if err := f.router.reg.Close(id, nil); err != nil {
+		f.t.Fatal(err)
+	}
 }
 
 func (f *fixture) agentProps(id string) any {
@@ -331,13 +333,16 @@ func (c *scriptedClient) Send(v any) bool {
 	request := v.(map[string]any)
 	if _, isCall := request["method"]; isCall {
 		c.asked = append(c.asked, request)
-		if c.during != nil {
-			c.during()
-		}
+		during := c.during
 		reply := c.replies[0]
 		c.replies = c.replies[1:]
 		reply["id"] = request["id"]
-		c.router.clients.Answer(c, reply)
+		go func() {
+			if during != nil {
+				during()
+			}
+			c.router.clients.Answer(c, reply)
+		}()
 	}
 	return true
 }

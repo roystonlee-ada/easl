@@ -1,6 +1,24 @@
 import AppKit
 import CanvasCore
+import Darwin
 import GhosttyTerminal
+
+if CommandLine.arguments.dropFirst().first == "--update-swap" {
+    guard CommandLine.arguments.count == 4 else {
+        FileHandle.standardError.write(Data("easl: --update-swap requires installed and incoming paths\n".utf8))
+        exit(2)
+    }
+    do {
+        try AppUpdate.swapBundles(installed: URL(fileURLWithPath: CommandLine.arguments[2]),
+                                  incoming: URL(fileURLWithPath: CommandLine.arguments[3]))
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("easl: bundle exchange failed: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+
+_ = AppPaths.isUpdateRelaunch
 
 // An install under an earlier name (Canvas 0.4 or 0.2, Chalkwork 0.3): its boards, settings and browser
 // profile, moved once, before anything reads AppPaths or the defaults (LegacyMigration). Never for
@@ -29,12 +47,49 @@ do {
     }
 }
 
+switch ZmxIsolation.decide(environment: ProcessInfo.processInfo.environment, uid: UInt32(getuid()),
+                           accountHome: FileManager.default.homeDirectoryForCurrentUser.path,
+                           guiTemp: guiTemporaryDirectory()) {
+case .installed:
+    break
+case .refuse(let reason):
+    refuseDevelopmentZmx(reason)
+case .isolated(let layout):
+    do {
+        for path in [layout.zmxDir, layout.stateHome, layout.tmpDir] {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        }
+    } catch {
+        refuseDevelopmentZmx("could not create this development home's zmx paths: \(error.localizedDescription)")
+    }
+    if setenv("ZMX_DIR", layout.zmxDir, 1) != 0
+        || setenv("XDG_STATE_HOME", layout.stateHome, 1) != 0
+        || setenv("TMPDIR", layout.tmpDir, 1) != 0 {
+        refuseDevelopmentZmx("could not set this development home's zmx paths")
+    }
+}
+
+func refuseDevelopmentZmx(_ reason: String) -> Never {
+    let line = "easl: refusing to start: \(reason)"
+    NSLog("%@", line)
+    FileHandle.standardError.write(Data((line + "\n").utf8))
+    exit(1)
+}
+
+func guiTemporaryDirectory() -> String? {
+    var buffer = [CChar](repeating: 0, count: 1024)
+    let length = confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count)
+    guard length > 1, length <= buffer.count else { return nil }
+    return String(cString: buffer)
+}
+
 // One instance per support directory: a second would take over the first's sockets. It hands the
-// root it was asked to open to the running instance, brings that one forward, and exits. After the
+// root it was asked to open to the running instance, and exits. After the
 // migration, which may move another support directory to this one's place.
 guard let instanceLock = InstanceLock.acquire(at: AppPaths.instanceLock) else {
     let holder = InstanceLock.holder(at: AppPaths.instanceLock)
-    if let root = AppDelegate.requestedRoot() {
+    let requestedRoot = AppDelegate.requestedRoot()
+    if let root = requestedRoot {
         do {
             let reply = try InstanceLock.forward(root: root.standardizedFileURL.path, to: AppPaths.apiSocket)
             if reply["ok"]?.bool != true { NSLog("easl: the running instance could not open %@: %@", root.path, "\(reply)") }
@@ -43,7 +98,7 @@ guard let instanceLock = InstanceLock.acquire(at: AppPaths.instanceLock) else {
         }
     }
     // Only a running easl: the pid may be a previous holder's, reused since (`holder`).
-    if ProcessInfo.processInfo.environment["EASL_NO_ACTIVATE"] != "1", let holder, let running = NSRunningApplication(processIdentifier: holder),
+    if requestedRoot == nil, !CanvasApplication.neverActivate, let holder, let running = NSRunningApplication(processIdentifier: holder),
        running.executableURL?.lastPathComponent == Bundle.main.executableURL?.lastPathComponent {
         running.activate()
     }
